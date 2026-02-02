@@ -1,0 +1,982 @@
+1. Code for Portfolio Part I
+#-------------------------------------------------------
+# Time-series analysis using a single GIMMS-NDVI series
+#-------------------------------------------------------
+library(Kendall)
+library(bfast)
+library(sp)
+library(raster)
+library(progress)
+library(RColorBrewer)
+
+#--------------------------------------------
+    # 1. Setup and Data Preparation 
+#--------------------------------------------
+# Set your working directory to a folder designated for this project
+setwd("C:/Users/yulia/Documents/R/PatternRecognition")
+
+# Import your NDVI data, which will typically be in a TIFF format representing stacked monthly data.
+filename <- "\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_1\\GIMMS_monthly_1982-2022.tif"
+ndvi_raster <- brick(filename)
+
+# Extract the first 12 layers (first year: 1982)
+ndvi_1982 <- subset(ndvi_raster, 1:12)
+
+# Plot the first 12 months of 1982
+plot(ndvi_1982, col=rev(terrain.colors(10)), legend=TRUE) 
+
+#--------------------------------------------
+     # 2. Data Manipulation 
+#--------------------------------------------
+# Convert the raster data into an array for easier manipulation.
+cube <- as.array(ndvi_raster) #3D
+
+# Prepare the data structure for storing the results of your trend analysis, specifically arrays 
+# to store the Mann-Kendall tau and p-values for each pixel.
+nrows <- nrow(cube) 
+ncols <- ncol(cube) 
+
+tau_array <- array(NA, c(nrows, ncols))
+pval_array <- array(NA, c(nrows, ncols))
+regcoeff <- array(NA, c(nrows, ncols)) 
+
+#--------------------------------------------
+    # 3. Trend Analysis 
+#--------------------------------------------
+# Implement the Seasonal Mann-Kendall test for each pixel across the time series data:
+# For each pixel, extract the time-series data
+# Ensure the time-series data is non-trivial (i.e., non-NA and has variance)
+# Calculate the Mann-Kendall test statistic and p-value
+# Store these results in your pre-defined arrays
+
+# Initialize progress bar
+pb <- winProgressBar(title = "progress bar", min = 0,max = nrows, width = 300)
+
+start.time <- Sys.time() #how long does it take, just checking
+
+# Loop through each pixel and calculate test statistics
+for (i in 1:nrows) {
+  setWinProgressBar(pb, i, title=paste( round(i/nrows*100, 0),"% done"))
+  for (j in 1:ncols) {
+    # Extract time-series for current pixel
+    x <- cube[i, j, ] #copy time-series into x
+    
+    # Calculate Seasonal Mann-Kendall test statistics
+    if (!is.na(x[1]) && var(x) > 0)
+      {
+        x <- ts(x,start=c(1983,1),frequency=12)
+        res <- SeasonalMannKendall(ts(x)) 
+        
+        # Store p-value, tau statistic, and slope in arrays
+        tau_array[i, j] <- res$tau
+        pval_array[i, j] <- res$sl * as.numeric(sign(res$tau))
+        time <- 1:dim(cube)[3]
+        model <- lm(x~time)
+        regcoeff[i, j] <- model$coefficients[2]
+     }  
+  }
+}
+close(pb)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+#--------------------------------------------
+    # 4. Progress Monitoring 
+#--------------------------------------------
+# Introduce a progress bar to monitor the analysis process, updating as each row of data is processed
+
+# Progress monitoring is already implemented in the loop using the progress bar
+
+library(rgdax)
+library(trend)
+library(dplyr)
+library(ggplot2)
+library(pbapply)
+#--------------------------------------------
+    # 5. Result Exporting 
+#--------------------------------------------
+# Convert your results arrays back into raster format, ensuring they align with the original 
+# data’s spatial extent and projection.
+tau_raster <- raster(tau_array, xmn=extent(ndvi_raster)[1], xmx=extent(ndvi_raster)[2], ymn=extent(ndvi_raster)[3], ymx=extent(ndvi_raster)[4], crs=projection(ndvi_raster))
+pval_raster <- raster(pval_array, xmn=extent(ndvi_raster)[1], xmx=extent(ndvi_raster)[2], ymn=extent(ndvi_raster)[3], ymx=extent(ndvi_raster)[4], crs=projection(ndvi_raster))
+regcoeff <- raster(regcoeff, xmn=extent(ndvi_raster)[1], xmx=extent(ndvi_raster)[2], ymn=extent(ndvi_raster)[3], ymx=extent(ndvi_raster)[4], crs=projection(ndvi_raster)) 
+
+# Export the results as TIFF files for the tau statistic, p-values, and regression coefficient
+# Set names for output files
+tau_file <- "tau.tif"
+pval_file <- "pval.tif"
+regcoeff_file <- "regcoeff.tif" 
+
+###################################################################################
+
+#reprojected Corine
+#Corine_projected <- project(Corine, crs(ndvi_raster))
+Corine_projected <-projectRaster(Corine,  ndvi_raster, crs, method = "bilinear")
+corine_resam <- resample(Corine_projected, ndvi_raster, method = "bilinear")
+plot(corine_resampled)
+
+# Extraire la partie entière des valeurs de pixel
+corine_resampled <- calc(corine_resam, fun = floor)
+plot(corine_resampled)
+
+# Set name for the significant greening raster
+#names(significant_greening_raster) <- "Significant Greening Trends"
+
+# Extract the significant greening trends and CORINE class values
+greening_values <- getValues(tau_raster)
+corine_values <- getValues(corine_resampled)
+plot(corine_values)
+plot(greening_values)
+
+# Combine the data into a data frame
+trend_data <- data.frame(greening = greening_values, corine = corine_values)
+
+# Filter out NA values
+trend_data <- trend_data %>% filter(!is.na(greening), !is.na(corine))
+# Calculate the count of significant greening pixels for each CORINE class
+greening_by_class <- trend_data %>%
+  group_by(corine) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+# Display the result
+print(greening_by_class)
+ggplot(greening_by_class)
+
+# Plot the contributions of each CORINE class to the greening trend
+ggplot(greening_by_class, aes(x = factor(corine), y = count)) +
+  geom_bar(stat = "identity", fill = "green") +
+  labs(x = "Land-Use/Cover Class", y = "Count of Greening Pixels",
+       title = "Contribution to Greening Trend by Land-used Class") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot the histogram using your data
+ggplot(greening_by_class, aes(x = factor(corine), y = count)) 
+
+###################################################################################
+
+# Write output files
+writeRaster(tau_raster, tau_file, format="GTiff", overwrite=TRUE)
+writeRaster(pval_raster, pval_file, format="GTiff", overwrite=TRUE)
+writeRaster(regcoeff, regcoeff_file, format = "GTiff", overwrite = TRUE) 
+
+# Optionally, convert these rasters into KML files for visualization
+KML (tau_raster, file ='tau', col=rev(terrain.colors(255)),
+     maxpixels = ncell ( raster (tau_raster)),overwrite="TRUE")
+
+KML (pval_raster, file ='pval',  col = hcl.colors(12, "YlOrRd", rev = TRUE) ,
+     maxpixels = ncell ( raster (pval_raster)),overwrite="TRUE")
+
+KML (regcoeff, file = 'regcoeff.kml', col = rev(terrain.colors(255)), 
+     maxpixels = ncell(raster(regcoeff)), overwrite = TRUE) 
+
+#--------------------------------------------
+    # 6. Visualization and Interpretation 
+#--------------------------------------------
+# Plot the resulting rasters using appropriate color scales to visually assess the trends.
+# Made with QGIS
+plot(tau_raster)
+plot(pval_raster)
+plot(regcoeff)
+
+#------------- to answer 1st question - change in % -------------------------------
+
+# Load the raster data
+raster_stack <- (ndvi_raster/10000)
+
+# Load the regression coefficient raster
+regcoeff_raster <- raster("regcoeff.tif")
+
+# Calculate the mean NDVI for the year 1982
+ndvi_1982 <- calc(raster_stack[[1:12]], mean, na.rm = TRUE)
+writeRaster(ndvi_1982, "NDVI_1982.tif", format = "GTiff", overwrite = TRUE)
+
+# Calculate the absolute change in NDVI values from 1982 to 2022
+years_period <- 41
+absolute_change <- (regcoeff_raster * years_period)
+writeRaster(absolute_change, "Abs_change.tif", format = "GTiff", overwrite = TRUE)
+
+# Calculate the percentage change in NDVI values
+percent_change <- overlay(absolute_change, ndvi_1982, fun = function(change, ref) {
+  ifelse(is.na(ref) | ref == 0, NA, (change / ref) * 100)
+})
+plot(percent_change)
+# Plot the results
+plot(percent_change, main = "Percent Change in NDVI (1982-2022)", col = terrain.colors(100))
+
+# Save the result as a GeoTIFF file
+writeRaster(percent_change, "percent_change_ndvi_BNew_1982_2022.tif", format = "GTiff", overwrite = TRUE)
+
+#------------- to answer 2nd question - the code to remove months -----------------
+# Load the raster data
+raster_stack <- stack("C:/Julia/Study in Germany_Trier University/Pattern Recognition/Portfolio/Part_1/GIMMS_monthly_1982-2022.tif")
+# Determine the number of complete years
+total_layers <- nlayers(raster_stack)
+number_of_years <- total_layers %/% 12 # calculate how many full years are present
+
+# Indices to keep
+indices_to_keep <- unlist(lapply(0:(number_of_years - 1), function(year) {
+  start <- 4 + year * 12
+  end <- 9 + year * 12
+  start:end
+}))
+
+# Ensure the indices do not exceed the total number of layers
+indices_to_keep <- indices_to_keep[indices_to_keep <= total_layers]
+
+# Subset the raster stack
+filtered_raster_stack <- raster_stack[[indices_to_keep]]
+
+# Export to a new TIFF file
+writeRaster(filtered_raster_stack, filename = "filtered_ndvi_data.tif",
+            format = "GTiff", overwrite = TRUE)
+
+# Convert the raster data into an array for easier manipulation
+summer_cube <- as.array(filtered_raster_stack)  # 3D array for summer months
+
+# Prepare the data structure for storing the results of your trend analysis
+nrows <- nrow(summer_cube)
+ncols <- ncol(summer_cube)
+summer_tau_array <- array(NA, c(nrows, ncols))
+summer_pval_array <- array(NA, c(nrows, ncols))
+summer_regcoeff <- array(NA, c(nrows, ncols))
+
+# Initialize progress bar
+pb <- winProgressBar(title = "progress bar", min = 0, max = nrows, width = 300)
+
+start.time <- Sys.time()  # Track the time taken for the analysis
+
+# Loop through each pixel and calculate test statistics
+for (i in 1:nrows) {
+  setWinProgressBar(pb, i, title = paste(round(i / nrows * 100, 0), "% done"))
+  for (j in 1:ncols) {
+    # Extract time-series for the current pixel
+    x <- summer_cube[i, j, ]
+    
+    # Calculate Seasonal Mann-Kendall test statistics
+    if (!is.na(x[1]) && var(x) > 0) {
+      x <- ts(x, start=c(1983, 4), frequency=6) # start in April, frequency is 6 (April-September)
+      res <- SeasonalMannKendall(x)
+      # Store p-value, tau statistic, and slope in arrays
+      summer_tau_array[i, j] <- res$tau
+      summer_pval_array[i, j] <- res$sl * as.numeric(sign(res$tau))
+      
+      time <- 1:length(x)
+      model <- lm(x ~ time)
+      summer_regcoeff[i, j] <- model$coefficients[2]
+    }
+  }
+}
+close(pb)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+# Convert your results arrays back into raster format, ensuring they align with the original data’s spatial extent and projection
+summer_tau_raster <- raster(summer_tau_array, xmn=extent(ndvi_raster)[1], xmx=extent(ndvi_raster)[2], ymn=extent(ndvi_raster)[3], ymx=extent(ndvi_raster)[4], crs=projection(ndvi_raster))
+summer_pval_raster <- raster(summer_pval_array, xmn=extent(ndvi_raster)[1], xmx=extent(ndvi_raster)[2], ymn=extent(ndvi_raster)[3], ymx=extent(ndvi_raster)[4], crs=projection(ndvi_raster))
+summer_regcoeff_raster <- raster(summer_regcoeff, xmn=extent(ndvi_raster)[1], xmx=extent(ndvi_raster)[2], ymn=extent(ndvi_raster)[3], ymx=extent(ndvi_raster)[4], crs=projection(ndvi_raster))
+
+# Export the results as TIFF files for the tau statistic, p-values, and regression coefficient
+# Set names for output files
+summer_tau_file <- "summer_tau.tif"
+summer_pval_file <- "summer_pval.tif"
+summer_regcoeff_file <- "summer_regcoeff.tif"
+
+# Write output files
+writeRaster(summer_tau_raster, summer_tau_file, format="GTiff", overwrite=TRUE)
+writeRaster(summer_pval_raster, summer_pval_file, format="GTiff", overwrite=TRUE)
+writeRaster(summer_regcoeff_raster, summer_regcoeff_file, format="GTiff", overwrite=TRUE)
+
+# Optionally, convert these rasters into KML files for visualization
+KML(summer_tau_raster, file='summer_tau.kml', col=rev(terrain.colors(255)), maxpixels=ncell(raster(summer_tau_raster)), overwrite=TRUE)
+KML(summer_pval_raster, file='summer_pval.kml', col=hcl.colors(12, "YlOrRd", rev=TRUE), maxpixels=ncell(raster(summer_pval_raster)), overwrite=TRUE)
+KML(summer_regcoeff_raster, file='summer_regcoeff.kml', col=rev(terrain.colors(255)), maxpixels=ncell(raster(summer_regcoeff_raster)), overwrite=TRUE)
+
+# Plot the resulting rasters using appropriate color scales to visually assess the trends
+plot(summer_tau_raster, main="Summer Tau Statistic", col=rev(terrain.colors(100)))
+plot(summer_pval_raster, main="Summer P-Values", col=hcl.colors(12,"YlOrRd",rev=TRUE))
+plot(summer_regcoeff_raster, main="Summer Regression Coefficient", col=rev(terrain.colors(100)))
+#-- calculating % of change for summer - made just to look, we can not to include it--
+
+# Export the percent change in NDVI based on summer regression coefficient
+summer_mean_ndvi_raster <- calc(filtered_raster_stack, mean, na.rm=TRUE)
+
+# Calculate the absolute change in NDVI using the regression coefficient (slope) and number of years
+summer_absolute_change <- (summer_regcoeff_raster * number_of_years)
+
+# Calculate the percentage change based on the regression coefficient
+summer_percent_change <- overlay(summer_absolute_change, summer_mean_ndvi_raster, fun=function(change, ref) {
+  ifelse(is.na(ref) | ref == 0, NA, (change / ref) * 100)
+})
+
+# Choose a diverging color palette (e.g., RdBu or RdYlBu)
+summer_color_palette <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(100)
+
+# Plot the updated result
+plot(summer_percent_change, main="Percent Change in Summer NDVI", col=summer_color_palette)
+
+# Add a legend
+plot(summer_percent_change, main="Percent Change in Summer NDVI", col=summer_color_palette,
+     legend.args=list(text='Percent Change', side=4, font=2, line=2.6, cex=0.8))
+
+# Export the updated percent change raster as a TIFF file
+writeRaster(summer_percent_change, "Good_summer_percent_change_ndvi_Bon.tif", format="GTiff", overwrite=TRUE)
+
+#------------ to answer 3rd question - split the time serials in 2 parts ----------
+#split GIMMS data in two sub-data set 
+
+raster_stack <- stack("GIMMS_monthly_1982-2022.tif") #Load Your Raster Time Series from /01/1983 end 12/2022
+n_layers <- nlayers(raster_stack) #Check the Number of Layers
+print(n_layers)  # from This should print 492 months
+
+# Determine the split points
+end_first_period <- 180  # from 01/1983-01/1998
+start_second_period <- 300  # from 12/2007-2022
+
+# Split the raster stack
+raster_stack_part1 <- raster_stack[[1:end_first_period]]  # First 15 years
+raster_stack_part2 <- raster_stack[[start_second_period:(start_second_period + 19)]]  # the last 15 years
+
+# Save the first 15-year period
+writeRaster(raster_stack_part1, "NDVI_1982_1998.tif", format = "GTiff", overwrite = TRUE)
+
+# Save the second 15-year period
+writeRaster(raster_stack_part2, "NDVI_2007_2022.tif", format = "GTiff", overwrite = TRUE)
+
+#---------------------------------------------------
+#For NDVI_1982-1998
+#---------------------------------------------------
+
+cube <- as.array(raster_stack_part1) # Convert raster to data frame with coordinates
+
+nrows <- nrow(cube) # Create empty arrays to have a table structure of our data
+ncols <- ncol(cube)
+
+tau_array <- array(NA, c(nrows, ncols)) # affect tau and p-values to that empty arrays
+pval_array <- array(NA, c(nrows, ncols))
+
+# Loop through each pixel and calculate test statistics
+
+pb <- winProgressBar(title = "progress bar", # Initialize progress bar
+                     min = 0,max = nrows, width = 300)
+start.time <- Sys.time() #just help to understand how long computation will take
+
+for (i in 1:nrows) {
+  setWinProgressBar(pb, i,
+                    title=paste( round(i/nrows*100, 0),"% done"))
+  for (j in 1:ncols) {
+    # Extract time-series for current pixel
+    x <- cube[i, j, ]
+    
+    # Calculate Seasonal Mann-Kendall test statistics
+    if (!is.na(x[1]) && var(x) > 0) #check if the variance is granther than 0
+    {
+      
+      x <- ts(x,start=c(1983,1),frequency=12)#convert in time series format
+      res <- SeasonalMannKendall(ts(x)) 
+      
+      # Store p-value and tau statistic in arrays
+      tau_array[i, j] <- res$tau
+      pval_array[i, j] <- res$sl * as.numeric(sign(res$tau))
+    }  
+  }
+}
+
+close(pb)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+# Create output raster files
+
+tau1_raster <- raster(tau_array, xmn=extent(raster_stack_part1)[1], xmx=extent(raster_stack_part1)[2], ymn=extent(raster_stack_part1)[3], ymx=extent(raster_stack_part1)[4], crs=projection(raster_stack_part1))
+pval1_raster <- raster(pval_array, xmn=extent(raster_stack_part1)[1], xmx=extent(raster_stack_part1)[2], ymn=extent(raster_stack_part1)[3], ymx=extent(raster_stack_part1)[4], crs=projection(raster_stack_part1))
+
+# Set names for output files
+tau1_file <- "tau_part1.tif"
+pval1_file <- "pva_part1.tif"
+
+# Write output files
+writeRaster(tau1_raster, tau1_file, format="GTiff", overwrite=TRUE)
+writeRaster(pval1_raster, pval1_file, format="GTiff", overwrite=TRUE)
+
+#---------------------------------------------------
+#For NDVI_2007-2022
+#---------------------------------------------------
+
+cube <- as.array(raster_stack_part2) # Convert raster to data frame with coordinates
+
+nrows <- nrow(cube) # Create empty arrays to have a table structure of our data
+ncols <- ncol(cube)
+
+tau2_array <- array(NA, c(nrows, ncols)) # affect tau and p-values to that empty arrays
+pval2_array <- array(NA, c(nrows, ncols))
+
+
+# Loop through each pixel and calculate test statistics
+
+pb <- winProgressBar(title = "progress bar", # Initialize progress bar
+                     min = 0,max = nrows, width = 300)
+start.time <- Sys.time() #just help to understand how long computation will take
+
+for (i in 1:nrows) {
+  setWinProgressBar(pb, i,
+                    title=paste( round(i/nrows*100, 0),"% done"))
+  for (j in 1:ncols) {
+    # Extract time-series for current pixel
+    x <- cube[i, j, ]
+    
+    # Calculate Seasonal Mann-Kendall test statistics
+    if (!is.na(x[1]) && var(x) > 0) #check if the variance is granther than 0
+    {
+      
+      x <- ts(x,start=c(1983,1),frequency=12)#convert in time series format
+      res <- SeasonalMannKendall(ts(x)) 
+      
+      # Store p-value and tau statistic in arrays
+      tau2_array[i, j] <- res$tau
+      pval2_array[i, j] <- res$sl * as.numeric(sign(res$tau))
+    }  
+  }
+}
+
+close(pb)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+# Create output raster files
+
+tauP2_raster <- raster(tau2_array, xmn=extent(raster_stack_part1)[1], xmx=extent(raster_stack_part1)[2], ymn=extent(raster_stack_part1)[3], ymx=extent(raster_stack_part1)[4], crs=projection(raster_stack_part1))
+pvalP2_raster <- raster(pval2_array, xmn=extent(raster_stack_part1)[1], xmx=extent(raster_stack_part1)[2], ymn=extent(raster_stack_part1)[3], ymx=extent(raster_stack_part1)[4], crs=projection(raster_stack_part1))
+
+# Set names for output files
+tau2_file <- "tau_part2.tif"
+pval2_file <- "pval_part2.tif"
+
+# Write output files
+writeRaster(tauP2_raster, tau2_file, format="GTiff", overwrite=TRUE)
+writeRaster(pvalP2_raster, pval2_file, format="GTiff", overwrite=TRUE)
+
+#------------ to answer 4th question ---------------------------------------
+# load required library
+library(readxl)
+library(terra)
+library(raster)
+
+# Load the land cover legend file
+legend_path <- "\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_1\\clc_legend.xls"
+clc_legend <- read_excel(legend_path, sheet = 1)
+
+# Load the GeoTIFF files
+geo2 <- rast("C:/Julia/Study in Germany_Trier University/Pattern Recognition/Portfolio/Part_1/clc8km_clip1.tif")
+geo1 <- rast("C:/Users/yulia/Documents/R/PatternRecognition/tau.tif") # NDVI trends file (assuming tau raster)
+
+# Check and print CRS information
+print(crs(geo2))
+print(crs(geo1))
+
+# Reproject to match the CRS of the second image
+geo1_projected <- project(geo1, crs(geo2))
+
+# Align extent and resolution
+geo1_resampled <- resample(geo1_projected, geo2, method = "bilinear") # Choose an appropriate method
+plot(geo1_resampled)
+
+# Save the aligned GeoTIFF
+writeRaster(geo1_resampled, "C:/Users/yulia/Documents/R/PatternRecognition/tau_reprojected.tif")
+
+#----------- Converting of the labels ------
+# to simplify the land-cover data from a level 3 classification to level 2
+convert_to_level2 <- function(code) {
+  return(as.integer(code/10)) # divides by 10 and converts to integer
+}
+
+# apply the conversion function to every cell in the raster using terra's app function
+level2_raster <- app(geo2, fun = convert_to_level2)
+
+# save the level 2 raster
+writeRaster(level2_raster, "level2_land_cover.tif")
+
+# Optionally, you can check the output
+plot(level2_raster)
+
+
+# Calculate the mean greening trend for each land cover class
+greenness_trend <- as.matrix(geo1_resampled)
+land_cover <- as.matrix(level2_raster)
+
+# Create a data frame to store the results
+results <- data.frame(class = unique(land_cover), mean_trend = NA)
+
+# Print the unique land cover classes
+print(unique(land_cover))
+
+# Calculate mean trend for each class
+for (class in unique(land_cover)) {
+  mask <- land_cover == class
+  masked_trend <- greenness_trend[mask]
+  
+  # Print debug information
+  print(paste("Class:", class, "Mean Trend:", mean(masked_trend, na.rm = TRUE), "Pixels:", sum(mask)))
+  
+  mean_trend <- mean(masked_trend, na.rm = TRUE)
+  results[results$class == class, "mean_trend"] <- mean_trend
+}
+
+# Print the results
+print(results)
+
+# Optionally, you can write the results to a CSV file
+write.csv(results, "land_cover_greening_trend.csv", row.names = FALSE)
+
+
+
+2. Code for Portfolio Part II
+# Load required library
+library(terra)
+library(raster)
+setwd("C:/Users/yulia/Documents/R/PatternRecognition")
+
+#########################################
+# adjust coordinate system of GIMMS data
+#########################################
+
+# Load the GeoTIFF files
+CLC <- rast("\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_1\\clc8km_clip1.tif")
+GIMMS <- rast("\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_1\\GIMMS_monthly_1982-2022.tif")
+
+# Reproject to match the CRS of the second image
+GIMMS_projected <- project(GIMMS, crs(CLC))
+
+# Align extent and resolution
+cube <- resample(GIMMS_projected, CLC, method="bilinear")  # Choose an appropriate interpolation method
+
+# Save the aligned GeoTIFF
+writeRaster(cube, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\europe_years_stacked_reprojected.tif", overwrite = T)
+
+#########################################
+# adjust CORINE land use classes:
+# create land-cover map: semi-natural and arable land
+#########################################
+
+CLC <- raster("\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_1\\clc8km_clip1.tif")
+
+# Function to convert level 3 codes to level 1
+convert_to_level1 <- function(code) {
+  return(as.integer(code / 100))  # Divides by 100 and converts to integer to drop the last digit }
+
+# Apply the conversion function to every cell in the raster
+level1_raster <- calc(CLC, convert_to_level1)
+
+# Save the level 2 raster
+writeRaster(level1_raster, "level1_land_cover.tif", format="GTiff", overwrite = T)
+
+# Optionally, you can check the output
+plot(level1_raster)
+
+library(raster)
+library(classInt)
+
+##########################
+#### Implement the 
+#### syndrome approach
+##########################
+
+library(Kendall)
+
+GIMMS_name<- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\europe_years_stacked_reprojected.tif"
+
+CLC_name <-"C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\level1_land_cover.tif"
+
+filenameOUT_syndrome <- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\syndromes"
+
+cube<-brick(GIMMS_name)
+luc<-raster(CLC_name)
+
+syndrome<-matrix(data <- NA, nrow <- dim(cube)[1],ncol <- dim(cube)[2])
+
+x1 <- sin(2*pi*1/12*(1:12)) 
+x2 <- cos(2*pi*1/12*(1:12))
+x3 <- sin(2*pi*1/12*2*(1:12)) 
+x4 <- cos(2*pi*1/12*2*(1:12))
+pb <- winProgressBar(title = "progress bar", min = 0, max = nrow(cube), width = 300)
+
+years <- dim(cube)[3]/12
+
+amp<-1:years *NA
+peak<-1:years *NA
+integral<-1:years *NA
+
+for (i in 1:nrow(cube)){
+  for (j in 1:ncol(cube)) {
+    setWinProgressBar(pb, i, title=paste( round(i/nrow(cube)*100, 0),"% done"))
+    ###### annual modelling the seasonal shape...
+    
+    GIMMS<-cube[i,j,]
+    if (sum(is.na(luc[i,j])) == 0 & sum(is.na(cube[i,j,])) == 0)  { 
+      time<-1:12 
+      
+      
+      for (k in 1:years) {
+        model <- lm(GIMMS[time] ~ cbind(x1,x2,x3,x4))
+        amp[k]<- max(model$fit) - min(model$fit)
+        peak[k]<- which(model$fit == max(model$fit))[1]
+        integral[k]<-sum(GIMMS[time])          
+        time <- time + 12  }
+      
+      # Trends for PEAK, AMPL and NDVI         
+      #NDVI
+      model_integral <- MannKendall(ts(integral)) 
+      model_amp     <- MannKendall(ts(amp))
+      model_peak     <- MannKendall(ts(peak))
+      
+      pintegral <- model_integral$sl * as.numeric(sign(model_integral$tau))
+      pamp       <- model_amp$sl     *  as.numeric(sign(model_amp$tau))
+      ppeak      <- model_peak$sl     * as.numeric(sign(model_peak$tau))
+       
+      #" increasing biomass "=1
+      #" decreasing biomass "=2
+      #" changing crop "=3
+      #" increasing productivity "=4
+      #" decreasing productivity "=5
+      #" increasing irrigation "=6
+      #" decreasing irrigation "=7
+      ### from here on the assignment of the syndrome rules begins
+      ## syndromes for semi - natural areas
+      
+      sig <- 0.05
+      
+      # semi-natural
+      
+      # increasing biomass
+      # +00
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) > sig & abs ( pamp ) > sig & luc [i,j] == 3) 
+      { syndrome [i,j] <- 1}       # only one sig. trend!!!
+      # ++0
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) < sig & ppeak > 0 & abs ( pamp ) > sig & luc [i,j] == 3)
+      { syndrome [i,j] <- 1}
+      # +0+
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp > 0 & luc [i,j] == 3)
+      { syndrome [i,j] <- 1}
+      
+      #+-0
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) < sig &  ppeak < 0 & abs ( pamp ) > sig & luc [i,j] == 3)
+      { syndrome [i,j] <- 1}
+      
+      #+0-
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp < 0 & luc [i,j] == 3)
+      { syndrome [i,j] <- 1}
+      
+      
+      # decreasing biomass
+      # ---
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) < sig & pamp < 0 & luc [i,j] == 3) # passt
+      { syndrome [i,j] <- 2}
+      # -00
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) > sig & abs ( pamp ) > sig & luc [i,j] == 3) # passt
+      { syndrome [i,j] <- 2}
+      
+      # -0-
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp < 0 & luc [i,j] == 3) # passt
+      { syndrome [i,j] <- 2}
+      # --0
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) > sig & luc [i,j] == 3) # passt
+      { syndrome [i,j] <- 2}
+      
+      # no change
+      # 000
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) > sig & abs ( pamp ) > sig & luc [i,j] == 3)
+      { syndrome [i,j] <- 0}
+      
+      
+      # arable land...
+      
+      # increasing productivity
+      # +00
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) > sig & abs ( pamp ) > sig & luc [i,j] == 2)
+      { syndrome [i,j] <- 4}
+      
+      # +0+
+      
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp > 0 & luc[i,j] == 2)
+      { syndrome [i,j] <- 4}
+      
+      # decreasing productivity
+      # -00
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) > sig & abs ( pamp ) > sig & luc [i,j] == 2)
+      { syndrome [i,j] <- 5}
+      
+      # -0-
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp < 0 & luc [i,j] == 2)
+      { syndrome[i,j] <- 5}
+      
+      # expansion of irrigartion
+      # +++
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) < sig & ppeak > 0 & abs ( pamp ) < sig & pamp > 0 & luc [i,j] == 2)
+      { syndrome[i,j] <- 6}
+      # ++0
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) < sig & ppeak > 0 & abs ( pamp ) > sig & luc [i,j] == 2)
+      { syndrome[i,j] <- 6}
+      #++ -
+      if ( abs ( pintegral ) < sig & pintegral > 0 & abs ( ppeak ) < sig & ppeak > 0 & abs ( pamp ) < sig & pamp < 0 & luc [i,j] == 2)
+      { syndrome[i,j] <- 6}
+      
+      # decreasing irrigation
+      # ---
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) < sig & pamp < 0 & luc [i,j] == 2)
+      { syndrome[i,j] <- 7}
+      # --0
+      if ( abs ( pintegral ) < sig & pintegral < 0 & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) > sig & luc [i,j] == 2)
+      { syndrome [i,j] <- 7}
+      #0 -0
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) > sig & luc [i,j] == 2)
+      { syndrome [i,j] <- 7}
+      #0--
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) < sig & pamp < 0 & luc[i,j] == 2)
+      { syndrome [i,j] <- 7}
+      
+      
+      # changing crop type
+      
+      #00 -
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp < 0 & luc [i,j] == 2)
+      { syndrome[i,j] <- 3}
+      # 00+
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) > sig & abs ( pamp ) < sig & pamp > 0 & luc [i,j] == 2)
+      { syndrome [i,j] <- 3}
+      
+      # 0-0
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) < sig & ppeak < 0 & abs( pamp ) > sig & luc[i,j] == 2)
+      { syndrome [i,j] <- 3}
+      
+      # 0+0
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) < sig & ppeak > 0 & abs( pamp ) > sig & luc[i,j] == 2)
+      { syndrome [i,j] <- 3}
+      # 0++
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) < sig & ppeak > 0 & abs( pamp ) < sig & pamp > 0 & luc [i,j] == 2) # passt
+      { syndrome [i,j] <- 3}
+      
+      #no change class
+      # 000
+      if ( abs ( pintegral ) > sig & abs ( ppeak ) > sig & abs ( pamp ) > sig & luc [i,j] ==2)
+      { syndrome [i,j] <- 0}
+    }
+    
+  }
+} 
+close(pb)
+
+#-------------------------------
+# Trend evaluation
+#-------------------------------
+#" increasing biomass "=1
+#" decreasing biomass "=2
+#" changing crop "=3
+#" increasing productivity "=4
+#" decreasing productivity "=5
+#" increasing irrigation "=6
+#" decreasing irrigation "=7
+total <- sum(!is.na(syndrome)) # total No. of pixels
+
+sum(syndrome==1,na.rm = T)
+sum(syndrome==2,na.rm = T)
+sum(syndrome==3,na.rm = T)
+sum(syndrome==4,na.rm = T)
+sum(syndrome==5,na.rm = T)
+sum(syndrome==6,na.rm = T)
+sum(syndrome==7,na.rm = T)
+
+syndrome_raster <- raster(syndrome, crs=projection(syndrome))
+writeRaster(syndrome_raster, "syndromes.tif", format="GTiff")
+
+
+3. Code for Portfolio Part III
+##################################
+## Distributed Lag Models (part I)
+##################################
+#use Botswana_NDVI_USGS and rs_rain_chirps_Botswana ENVI files
+
+library(quantmod) # to backshift rainfall data 
+library(forecast) # auto.arima function
+library(lmtest)   # durbin-watson test
+library(raster)
+library(terra)
+
+# Set your working directory to a folder designated for this project
+setwd("C:/Users/yulia/Documents/R/PatternRecognition/Botswana")
+
+library(caTools)
+#filenameVI <- "\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_3\\Botswana\\Botswana_NDVI_USGS"
+#cubeVI <- read.ENVI(filenameVI, headerfile = paste(filenameVI, ".hdr",sep = ""))
+
+filenameVI <- "\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_3\\Botswana\\Botswana_NDVI_USGS.tif"
+cubeVI <- stack(filenameVI)
+# Convert RasterStack/RasterBrick to a 3D array
+cubeVI <- as.array(cubeVI)
+
+
+#filenameRF <- "\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_3\\Botswana\\rs_rain_chirps_Botswana"
+#cubeRF<-read.ENVI(filenameRF, headerfile<-paste(filenameRF, ".hdr", sep=""))
+
+filenameRF <- "\\Julia\\Study in Germany_Trier University\\Pattern Recognition\\Portfolio\\Part_3\\Botswana\\rs_rain_chirps_Botswana.tif"
+cubeRF <- stack(filenameRF)
+cubeRF <- as.array(cubeRF)
+
+# Outputs
+filenameOUTp <- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendP"
+filenameOUTr <- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendR"
+filenameDW <- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendDW"
+filenameRmult <- C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendRmult"
+filenameFmult <- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendFmult"
+filenameFsig <- "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendFsig"
+
+#outputs
+out_pvalues <- array(NaN,c(nrow(cubeVI),ncol(cubeVI),7))
+outreg <- out_pvalues
+
+#Durbin-Watson Test
+DW <- array(NaN,c(nrow(cubeVI),ncol(cubeVI)))
+# multiple R2
+Rmult <- DW
+# F-value
+Fmult <- DW
+# p-value F-Value
+Fsig <- DW
+
+#library(remote)
+pb <- winProgressBar(title = "progress bar", min = 0, max = nrow(cubeVI), width = 300)
+
+# row index
+for (i in 1:nrow(cubeVI)){
+  # col index
+  for (j in 1:ncol(cubeVI)) {
+    setWinProgressBar(pb, i, title=paste( round(i/nrow(cubeVI)*100, 0),"% done"))
+    ###### annual modelling the seasonal shape...
+    
+    VI <- ts(cubeVI[i,j,], start=c(2000,1), frequency=12)
+    RF <- ts(cubeRF[i,j,], start=c(2000,1), frequency=12)
+    
+    if (VI [1] > 0) {
+      # Time-series decomposition to remove trend and cyclic components
+      
+      VI <- stl(VI,"periodic")
+      RF <- stl(RF,"periodic")
+      VI <- VI[[1]][,3]  # the remainder
+      RF <- RF[[1]][,3]
+      
+      model <- lm(VI ~ RF)
+      
+      #2. Arima-Model for residuals
+      optfit <- auto.arima(model$residuals, max.p=5, max.q = 0)
+      
+      #3. Filter original series 
+      yfiltered <- residuals(Arima(VI,model=optfit))
+      xfiltered <- residuals(Arima(RF,model=optfit))
+      
+      # setup distributed lag models
+      
+      lagX1 <- Lag (as.numeric(xfiltered), 1)
+      lagX2 <- Lag (as.numeric(xfiltered), 2)
+      lagX3 <- Lag (as.numeric(xfiltered), 3)
+      lagX4 <- Lag (as.numeric(xfiltered), 4)
+      lagX5 <- Lag (as.numeric(xfiltered), 5)
+      lagX6 <- Lag (as.numeric(xfiltered), 6)
+      
+      # 4. repeat OLS-regression 
+      x <- as.data.frame(cbind(yfiltered, xfiltered, lagX1, lagX2, lagX3,  lagX4, lagX5, lagX6))
+      names(x) <- c("ndvi","Lag0", "Lag1","Lag2","Lag3","Lag4","Lag5","Lag6")
+      
+      model <- lm(ndvi ~ ., data=x)
+      
+      out_pvalues[i,j,1] <- summary(model)[[4]][26] * as.numeric(sign(summary(model)[[4]][2]))
+      out_pvalues[i,j,2] <- summary(model)[[4]][27] * as.numeric(sign(summary(model)[[4]][3]))
+      out_pvalues[i,j,3] <- summary(model)[[4]][28] * as.numeric(sign(summary(model)[[4]][4]))
+      out_pvalues[i,j,4] <- summary(model)[[4]][29] * as.numeric(sign(summary(model)[[4]][5]))
+      out_pvalues[i,j,5] <- summary(model)[[4]][30] * as.numeric(sign(summary(model)[[4]][6]))
+      out_pvalues[i,j,6] <- summary(model)[[4]][31] * as.numeric(sign(summary(model)[[4]][7]))
+      out_pvalues[i,j,7] <- summary(model)[[4]][32] * as.numeric(sign(summary(model)[[4]][8]))
+      
+      outreg[i,j,1] <- summary(model)[[4]][2]
+      outreg[i,j,2] <- summary(model)[[4]][3]
+      outreg[i,j,3] <- summary(model)[[4]][4]
+      outreg[i,j,4] <- summary(model)[[4]][5]
+      outreg[i,j,5] <- summary(model)[[4]][6]
+      outreg[i,j,6] <- summary(model)[[4]][7]
+      outreg[i,j,7] <- summary(model)[[4]][8]
+     
+      
+      Rmult[i,j] <- summary(model)[[9]]
+      DW[i,j] <- dwtest(model)[[1]]
+      
+      # Calculate F-statistic and its p-value
+      Fmult[i, j] <- summary(model)$fstatistic[1]
+      Fsig[i, j] <- pf(Fmult[i, j], summary(model)$fstatistic[2], summary(model)$fstatistic[3], lower.tail = FALSE)
+    }    
+  } 
+}
+
+close(pb)
+
+# Create an empty list to store raster layers
+raster_layers <- vector("list", length = dim(out_pvalues)[3])
+
+# Calculate extents based on the array dimensions
+cols <- dim(out_pvalues)[2]
+rows <- dim(out_pvalues)[1]
+x_extent <- cols  # or scale by resolution, e.g., cols * resolution
+y_extent <- rows  # or scale by resolution, e.g., rows * resolution
+
+# Loop through each layer in the array to convert to raster
+for (i in 1:length(raster_layers)) {
+  # Convert the i-th layer of the array to a raster
+  # Adjust extent based on actual data dimensions
+  raster_layer <- raster(t(out_pvalues[,,i]), xmn=0, xmx=x_extent, ymn=0, ymx=y_extent)
+  # Name the layer for clarity
+  names(raster_layer) <- paste("Layer", i, sep="")
+  raster_layers[[i]] <- raster_layer
+}
+
+# Combine all raster layers into a RasterStack
+raster_stack <- stack(raster_layers)
+writeRaster(raster_stack, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\p-values", format="GTiff", overwrite = T)
+
+# the same for R2, Fmult...
+##############################################
+#outreg
+raster_layers <- vector("list", dim(outreg)[3])
+
+cols <- dim(outreg)[2]
+rows <- dim(outreg)[1]
+x_extent <- cols
+y_extent <- rows
+
+for (i in 1:length(raster_layers)) {
+  raster_layer <- raster(t(outreg[,,i]), xmn=0, xmx=x_extent, ymn=0, ymx=y_extent)
+  names(raster_layer) <- paste("Layer", i, sep="")
+  raster_layers[[i]] <- raster_layer
+}
+
+raster_stack <- stack(raster_layers)
+writeRaster(raster_stack, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendR", format="GTiff", overwrite=TRUE)
+
+#DW
+raster_layer <- raster(t(DW), xmn=0, xmx=ncol(DW), ymn=0, ymx=nrow(DW))
+writeRaster(raster_layer, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendDW", format="GTiff", overwrite=TRUE)
+
+#Rmult
+raster_layer <- raster(t(Rmult), xmn=0, xmx=ncol(Rmult), ymn=0, ymx=nrow(Rmult))
+writeRaster(raster_layer, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendRmult", format="GTiff", overwrite=TRUE)
+library(rgdal)
+trendRmult <- raster("C:/Users/yulia/Documents/R/PatternRecognition/Botswana/trendRmult.tif")
+plot(trendRmult, main="Multiple R^2-value", col=terrain.colors(10))
+
+#Fmult
+raster_layer <- raster(t(Fmult), xmn=0, xmx=ncol(Fmult), ymn=0, ymx=nrow(Fmult))
+writeRaster(raster_layer, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendFmult", format="GTiff", overwrite=TRUE)
+
+#Fsign
+raster_layer <- raster(t(Fsig), xmn=0, xmx=ncol(Fsig), ymn=0, ymx=nrow(Fsig))
+writeRaster(raster_layer, "C:\\Users\\yulia\\Documents\\R\\PatternRecognition\\Botswana\\trendFsig", format="GTiff", overwrite=TRUE)
