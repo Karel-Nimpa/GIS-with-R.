@@ -1,0 +1,1704 @@
+# ============================================================
+# PORTFOLIO III - SPATIAL REGRESSION FOR PM2.5 IN LONDON
+# ============================================================
+
+rm(list = ls())
+
+# ============================================================
+# 0) LOAD LIBRARIES
+# ============================================================
+library(sf)
+library(sp)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tmap)
+library(spdep)
+library(spatialreg)
+
+# ============================================================
+# 1) LOAD SPATIAL DATA
+# ============================================================
+
+GreaterLondonWards <- st_read(
+  "H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/London-wards-2018/London_Ward/London_Ward.shp"
+)
+
+PollutionGrid <- st_read(
+  "H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/LAEI2019-pm2-5-grid-emissions-all-sources/LAEI2019-pm2-5-grid-emissions-all-sources.shp"
+)
+
+# Quick plot
+spplot(as(PollutionGrid, "Spatial"), zcol = "all_2025", main = "PM2.5 Grid")
+
+# Check CRS
+st_crs(GreaterLondonWards)
+st_crs(PollutionGrid)
+
+# Transform pollution grid if needed
+if (st_crs(GreaterLondonWards) != st_crs(PollutionGrid)) {
+  PollutionGrid <- st_transform(PollutionGrid, st_crs(GreaterLondonWards))
+}
+
+# ============================================================
+# 2) AREA-WEIGHTED PM2.5 BY WARD
+# ============================================================
+
+Intersected <- st_intersection(GreaterLondonWards, PollutionGrid)
+
+Intersected <- Intersected %>%
+  mutate(intersect_area = st_area(.))
+
+WeightedPollution <- Intersected %>%
+  group_by(GSS_CODE) %>%
+  summarize(
+    mean_pollution = sum(all_2025 * as.numeric(intersect_area), na.rm = TRUE) /
+      sum(as.numeric(intersect_area), na.rm = TRUE)
+  )
+
+WeightedPollution$mean_pollution <- as.numeric(WeightedPollution$mean_pollution)
+
+WeightedPollution_df <- as.data.frame(WeightedPollution) %>%
+  dplyr::select(GSS_CODE, mean_pollution)
+
+GreaterLondonWards <- GreaterLondonWards %>%
+  left_join(WeightedPollution_df, by = "GSS_CODE")
+
+# ============================================================
+# 3) VISUALIZE RAW PM2.5
+# ============================================================
+
+tm_shape(GreaterLondonWards) +
+  tm_polygons("mean_pollution", palette = "YlOrRd", title = "Mean PM2.5") +
+  tm_layout(title = "Average PM2.5 Concentration by Ward")
+
+# Optional exploratory binned version
+GreaterLondonWards$log_pollution_bins <- cut(
+  log1p(GreaterLondonWards$mean_pollution),
+  breaks = quantile(log1p(GreaterLondonWards$mean_pollution),
+                    probs = seq(0, 1, 0.2),
+                    na.rm = TRUE),
+  include.lowest = TRUE
+)
+
+tm_shape(GreaterLondonWards) +
+  tm_polygons("log_pollution_bins", palette = "YlOrRd", title = "Log-binned PM2.5") +
+  tm_layout(title = "Log-Transformed & Binned PM2.5")
+
+GreaterLondonWards$log_pollution_bins <- NULL
+
+# ============================================================
+# 4) LOAD SOCIOECONOMIC DATA
+# ============================================================
+
+temp_file <- "H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/portfolio_2/ward-profiles-excel-version.csv"
+ward_data <- read.csv(temp_file, sep = ",")
+
+# Convert columns from 5th onward to numeric
+ward_data[, 5:ncol(ward_data)] <- lapply(
+  ward_data[, 5:ncol(ward_data)],
+  function(x) as.numeric(gsub(",", "", as.character(x)))
+)
+
+str(ward_data)
+
+# ============================================================
+# 5) MERGE SPATIAL + SOCIOECONOMIC DATA
+# ============================================================
+
+merged_data <- merge(
+  GreaterLondonWards,
+  ward_data,
+  by.x = "GSS_CODE",
+  by.y = "New.code",
+  all.x = TRUE
+)
+
+# Keep complete cases for modelling
+merged_data_clean <- na.omit(merged_data)
+
+# Store raw PM2.5, then log-transform for modelling
+merged_data_clean$pm25_raw <- merged_data_clean$mean_pollution
+merged_data_clean$mean_pollution <- log1p(merged_data_clean$mean_pollution)
+
+# Use ward IDs as row names (helpful for spatialreg prediction)
+rownames(merged_data_clean) <- merged_data_clean$GSS_CODE
+
+cat("\n========================================\n")
+cat("DATA CLEANING SUMMARY\n")
+cat("========================================\n")
+cat(sprintf("Original wards: %d\n", nrow(GreaterLondonWards)))
+cat(sprintf("After merge + NA removal: %d\n", nrow(merged_data_clean)))
+cat(sprintf("Dropped wards: %d\n", nrow(GreaterLondonWards) - nrow(merged_data_clean)))
+
+if (nrow(GreaterLondonWards) != nrow(merged_data_clean)) {
+  dropped_wards <- setdiff(GreaterLondonWards$GSS_CODE, merged_data_clean$GSS_CODE)
+  cat("Dropped ward IDs:\n")
+  print(dropped_wards)
+}
+
+# ============================================================
+# 6) QUEEN CONTIGUITY NEIGHBOURS ON FINAL CLEAN DATASET
+# ============================================================
+
+nb_queen <- poly2nb(merged_data_clean, queen = TRUE)
+lw_queen <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+
+# ============================================================
+# 7) NEIGHBOURHOOD STRUCTURE DIAGNOSTICS
+# ============================================================
+
+cat("\n========================================\n")
+cat("NEIGHBOURHOOD STRUCTURE DIAGNOSTICS\n")
+cat("========================================\n")
+
+n_neigh <- card(nb_queen)
+
+cat(sprintf("Number of wards: %d\n", length(nb_queen)))
+cat(sprintf("Minimum neighbours: %d\n", min(n_neigh)))
+cat(sprintf("Maximum neighbours: %d\n", max(n_neigh)))
+cat(sprintf("Mean neighbours: %.2f\n", mean(n_neigh)))
+cat(sprintf("Median neighbours: %.2f\n", median(n_neigh)))
+
+isolates <- which(n_neigh == 0)
+cat(sprintf("Number of isolates: %d\n", length(isolates)))
+if (length(isolates) > 0) {
+  cat("Isolated wards:\n")
+  print(merged_data_clean$GSS_CODE[isolates])
+}
+
+comp <- n.comp.nb(nb_queen)
+cat(sprintf("Number of connected components: %d\n", comp$nc))
+if (comp$nc > 1) {
+  cat("Component sizes:\n")
+  print(table(comp$comp.id))
+}
+
+hist(
+  n_neigh,
+  main = "Neighbour Count per Ward (Queen Contiguity)",
+  xlab = "Number of neighbours",
+  col = "lightblue",
+  border = "black"
+)
+
+# ============================================================
+# 8) GLOBAL MORAN'S I FOR LOG(PM2.5 + 1)
+# ============================================================
+
+global_moran <- moran.test(
+  merged_data_clean$mean_pollution,
+  lw_queen,
+  zero.policy = TRUE
+)
+
+cat("\n========================================\n")
+cat("GLOBAL MORAN'S I FOR LOG(PM2.5 + 1)\n")
+cat("========================================\n")
+print(global_moran)
+
+# ============================================================
+# 9) CORRELATION-BASED PREDICTOR SCREENING
+# ============================================================
+
+# Drop geometry first
+model_df <- st_drop_geometry(merged_data_clean)
+
+# Keep only numeric columns
+numeric_cols <- sapply(model_df, is.numeric)
+numeric_data <- model_df[, numeric_cols]
+
+# Exclude response and obvious non-predictors
+exclude_vars <- c("mean_pollution", "pm25_raw", "intersect_area")
+candidate_vars <- setdiff(names(numeric_data), exclude_vars)
+
+# Correlations with response
+correlations <- sapply(candidate_vars, function(v) {
+  cor(model_df[[v]], model_df$mean_pollution, use = "complete.obs")
+})
+
+sorted_correlations <- sort(abs(correlations), decreasing = TRUE)
+
+top_n <- 10
+top_variables <- names(sorted_correlations)[1:top_n]
+
+cor_table <- data.frame(
+  Variable = top_variables,
+  Correlation = correlations[top_variables],
+  AbsCorrelation = abs(correlations[top_variables]),
+  row.names = NULL
+)
+
+cat("\n========================================\n")
+cat("TOP CORRELATED PREDICTORS\n")
+cat("========================================\n")
+print(cor_table)
+
+# Optional correlation bar plot
+ggplot(cor_table, aes(x = reorder(Variable, AbsCorrelation), y = Correlation)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top Predictors of log(PM2.5 + 1)",
+    x = "Predictor",
+    y = "Correlation"
+  ) +
+  theme_minimal()
+
+# ============================================================
+# 10) FIT REGRESSION MODELS
+# ============================================================
+
+formula_str <- as.formula(
+  paste("mean_pollution ~", paste(top_variables, collapse = " + "))
+)
+
+# LM
+lm_model <- lm(formula_str, data = st_drop_geometry(merged_data_clean))
+summary(lm_model)
+
+# Spatial Lag Model
+lag_model <- lagsarlm(
+  formula_str,
+  data = st_drop_geometry(merged_data_clean),
+  listw = lw_queen,
+  zero.policy = TRUE
+)
+summary(lag_model)
+
+# Spatial Error Model
+error_model <- errorsarlm(
+  formula_str,
+  data = st_drop_geometry(merged_data_clean),
+  listw = lw_queen,
+  zero.policy = TRUE
+)
+summary(error_model)
+
+# ============================================================
+# 11) MODEL COMPARISON TABLE
+# ============================================================
+
+resid_lm    <- residuals(lm_model)
+resid_lag   <- residuals(lag_model)
+resid_error <- residuals(error_model)
+
+moran_lm    <- moran.test(resid_lm, lw_queen, zero.policy = TRUE)
+moran_lag   <- moran.test(resid_lag, lw_queen, zero.policy = TRUE)
+moran_error <- moran.test(resid_error, lw_queen, zero.policy = TRUE)
+
+model_comparison <- data.frame(
+  Model = c("Linear Model", "Spatial Lag Model", "Spatial Error Model"),
+  AIC = c(AIC(lm_model), AIC(lag_model), AIC(error_model)),
+  LogLik = c(
+    as.numeric(logLik(lm_model)),
+    as.numeric(logLik(lag_model)),
+    as.numeric(logLik(error_model))
+  ),
+  Residual_Moran_I = c(
+    unname(moran_lm$estimate[1]),
+    unname(moran_lag$estimate[1]),
+    unname(moran_error$estimate[1])
+  ),
+  Residual_Moran_p = c(
+    moran_lm$p.value,
+    moran_lag$p.value,
+    moran_error$p.value
+  )
+)
+
+cat("\n========================================\n")
+cat("MODEL COMPARISON TABLE\n")
+cat("========================================\n")
+print(model_comparison)
+
+# Optional export
+# write.csv(model_comparison, "model_comparison_pm25.csv", row.names = FALSE)
+
+# ============================================================
+# 12) COEFFICIENT COMPARISON TABLE
+# ============================================================
+
+# LM coefficients
+lm_coef <- summary(lm_model)$coefficients
+lm_df <- data.frame(
+  Variable = rownames(lm_coef),
+  LM_Estimate = lm_coef[, "Estimate"],
+  LM_p = lm_coef[, "Pr(>|t|)"],
+  row.names = NULL
+)
+
+# Lag coefficients
+lag_coef <- summary(lag_model)$Coef
+lag_df <- data.frame(
+  Variable = rownames(lag_coef),
+  Lag_Estimate = lag_coef[, "Estimate"],
+  Lag_p = lag_coef[, "Pr(>|z|)"],
+  row.names = NULL
+)
+
+# Error coefficients
+err_coef <- summary(error_model)$Coef
+err_df <- data.frame(
+  Variable = rownames(err_coef),
+  Error_Estimate = err_coef[, "Estimate"],
+  Error_p = err_coef[, "Pr(>|z|)"],
+  row.names = NULL
+)
+
+coef_comparison <- lm_df %>%
+  full_join(lag_df, by = "Variable") %>%
+  full_join(err_df, by = "Variable")
+
+cat("\n========================================\n")
+cat("COEFFICIENT COMPARISON TABLE\n")
+cat("========================================\n")
+print(coef_comparison)
+
+spatial_params <- data.frame(
+  Model = c("Spatial Lag Model", "Spatial Error Model"),
+  Spatial_Parameter = c("rho", "lambda"),
+  Estimate = c(lag_model$rho, error_model$lambda)
+)
+
+cat("\n========================================\n")
+cat("SPATIAL PARAMETERS\n")
+cat("========================================\n")
+print(spatial_params)
+
+# ============================================================
+# 13) RESIDUAL DIAGNOSTICS
+# ============================================================
+
+# -------------------------
+# LM
+# -------------------------
+par(mfrow = c(2, 2))
+
+hist(resid_lm, main = "Histogram of Residuals (LM)",
+     xlab = "Residuals", col = "lightgray", border = "black")
+
+fitted_lm <- fitted(lm_model)
+plot(fitted_lm, resid_lm,
+     main = "Residuals vs Fitted (LM)",
+     xlab = "Fitted Values", ylab = "Residuals",
+     col = "gray", pch = 20)
+abline(h = 0, col = "red")
+
+plot(fitted_lm, merged_data_clean$mean_pollution,
+     main = "Observed vs Fitted (LM)",
+     xlab = "Fitted Values", ylab = "Observed",
+     col = "gray", pch = 20)
+abline(a = 0, b = 1, col = "red")
+
+cat("Correlation (Observed vs Fitted, LM):",
+    cor(fitted_lm, merged_data_clean$mean_pollution), "\n")
+
+# -------------------------
+# Lag
+# -------------------------
+par(mfrow = c(2, 2))
+
+hist(resid_lag, main = "Histogram of Residuals (Lag Model)",
+     xlab = "Residuals", col = "lightblue", border = "black")
+
+fitted_lag <- fitted(lag_model)
+plot(fitted_lag, resid_lag,
+     main = "Residuals vs Fitted (Lag Model)",
+     xlab = "Fitted Values", ylab = "Residuals",
+     col = "blue", pch = 20)
+abline(h = 0, col = "red")
+
+plot(fitted_lag, merged_data_clean$mean_pollution,
+     main = "Observed vs Fitted (Lag Model)",
+     xlab = "Fitted Values", ylab = "Observed",
+     col = "blue", pch = 20)
+abline(a = 0, b = 1, col = "red")
+
+cat("Correlation (Observed vs Fitted, Lag Model):",
+    cor(fitted_lag, merged_data_clean$mean_pollution), "\n")
+
+# -------------------------
+# Error
+# -------------------------
+par(mfrow = c(2, 2))
+
+hist(resid_error, main = "Histogram of Residuals (Error Model)",
+     xlab = "Residuals", col = "lightgreen", border = "black")
+
+fitted_error <- fitted(error_model)
+plot(fitted_error, resid_error,
+     main = "Residuals vs Fitted (Error Model)",
+     xlab = "Fitted Values", ylab = "Residuals",
+     col = "green3", pch = 20)
+abline(h = 0, col = "red")
+
+plot(fitted_error, merged_data_clean$mean_pollution,
+     main = "Observed vs Fitted (Error Model)",
+     xlab = "Fitted Values", ylab = "Observed",
+     col = "green3", pch = 20)
+abline(a = 0, b = 1, col = "red")
+
+cat("Correlation (Observed vs Fitted, Error Model):",
+    cor(fitted_error, merged_data_clean$mean_pollution), "\n")
+
+# ============================================================
+# 14) MAP OBSERVED, PREDICTED, AND RESIDUALS
+# ============================================================
+
+merged_data_clean$lm_fitted <- fitted_lm
+merged_data_clean$lag_fitted <- fitted_lag
+merged_data_clean$error_fitted <- fitted_error
+
+merged_data_clean$lm_residuals <- resid_lm
+merged_data_clean$lag_residuals <- resid_lag
+merged_data_clean$error_residuals <- resid_error
+
+# Observed
+tm_observed <- tm_shape(merged_data_clean) +
+  tm_polygons("mean_pollution", title = "Observed log(PM2.5 + 1)",
+              palette = "Blues", style = "quantile") +
+  tm_layout(title = "Observed PM2.5")
+
+# Predicted
+tm_lm <- tm_shape(merged_data_clean) +
+  tm_polygons("lm_fitted", title = "Predicted (LM)",
+              palette = "Purples", style = "quantile") +
+  tm_layout(title = "Predicted by LM")
+
+tm_lag <- tm_shape(merged_data_clean) +
+  tm_polygons("lag_fitted", title = "Predicted (Lag)",
+              palette = "Greens", style = "quantile") +
+  tm_layout(title = "Predicted by Spatial Lag Model")
+
+tm_error <- tm_shape(merged_data_clean) +
+  tm_polygons("error_fitted", title = "Predicted (Error)",
+              palette = "Oranges", style = "quantile") +
+  tm_layout(title = "Predicted by Spatial Error Model")
+
+tmap_arrange(tm_observed, tm_lm, tm_lag, tm_error, ncol = 4)
+
+# Residual maps
+tm_lm_residuals <- tm_shape(merged_data_clean) +
+  tm_polygons("lm_residuals", title = "Residuals (LM)",
+              palette = "-RdBu", style = "quantile") +
+  tm_layout(title = "Residuals of LM")
+
+tm_lag_residuals <- tm_shape(merged_data_clean) +
+  tm_polygons("lag_residuals", title = "Residuals (Lag)",
+              palette = "-RdBu", style = "quantile") +
+  tm_layout(title = "Residuals of Spatial Lag Model")
+
+tm_error_residuals <- tm_shape(merged_data_clean) +
+  tm_polygons("error_residuals", title = "Residuals (Error)",
+              palette = "-RdBu", style = "quantile") +
+  tm_layout(title = "Residuals of Spatial Error Model")
+
+tmap_arrange(tm_lm_residuals, tm_lag_residuals, tm_error_residuals, ncol = 3)
+
+# ============================================================
+# 15) SPATIAL BLOCK CROSS-VALIDATION
+# ============================================================
+
+cat("\n========================================\n")
+cat("SPATIAL BLOCK CROSS-VALIDATION\n")
+cat("========================================\n")
+
+# ------------------------------------------------------------
+# 15.1 Create spatial blocks using k-means on centroids
+# ------------------------------------------------------------
+
+n_folds <- 5
+
+coords <- st_centroid(merged_data_clean)
+coords <- st_coordinates(coords)
+
+set.seed(42)
+spatial_clusters <- kmeans(coords, centers = n_folds, nstart = 25)
+merged_data_clean$spatial_block <- spatial_clusters$cluster
+
+tm_blocks <- tm_shape(merged_data_clean) +
+  tm_polygons("spatial_block",
+              palette = "Set3",
+              title = "CV Fold",
+              style = "cat") +
+  tm_layout(title = "Spatial Cross-Validation Blocks",
+            legend.outside = TRUE)
+print(tm_blocks)
+
+cat(sprintf("Created %d spatial blocks\n", n_folds))
+print(table(merged_data_clean$spatial_block))
+
+# ------------------------------------------------------------
+# 15.2 Run CV
+# ------------------------------------------------------------
+
+cv_results <- data.frame(
+  fold = integer(),
+  model = character(),
+  observed = numeric(),
+  predicted = numeric(),
+  test_size = integer()
+)
+
+buffer_distance <- 0
+
+for (fold in 1:n_folds) {
+  
+  cat(sprintf("\nProcessing fold %d/%d...\n", fold, n_folds))
+  
+  test_idx <- which(merged_data_clean$spatial_block == fold)
+  
+  if (buffer_distance > 0) {
+    suppressWarnings({
+      test_centroids <- st_centroid(merged_data_clean[test_idx, ])
+      train_candidates <- merged_data_clean[-test_idx, ]
+      train_centroids <- st_centroid(train_candidates)
+    })
+    
+    dist_matrix <- st_distance(train_centroids, test_centroids)
+    min_dist <- apply(dist_matrix, 1, min)
+    
+    buffer_idx <- which(min_dist > buffer_distance)
+    train_idx <- which(merged_data_clean$GSS_CODE %in% train_candidates$GSS_CODE[buffer_idx])
+    
+    cat(sprintf("With %dm buffer: %d train, %d test\n",
+                buffer_distance, length(train_idx), length(test_idx)))
+  } else {
+    train_idx <- which(merged_data_clean$spatial_block != fold)
+    cat(sprintf("Train: %d wards, Test: %d wards\n",
+                length(train_idx), length(test_idx)))
+  }
+  
+  if (length(train_idx) < 50) {
+    cat("Skipping fold (insufficient training data)\n")
+    next
+  }
+  
+  train_data <- merged_data_clean[train_idx, ]
+  test_data  <- merged_data_clean[test_idx, ]
+  
+  rownames(train_data) <- train_data$GSS_CODE
+  rownames(test_data)  <- test_data$GSS_CODE
+  
+  train_df <- st_drop_geometry(train_data)
+  test_df  <- st_drop_geometry(test_data)
+  
+  # Queen neighbours on training data
+  train_nb <- poly2nb(train_data, queen = TRUE)
+  train_lw <- nb2listw(train_nb, style = "W", zero.policy = TRUE)
+  
+  # Formula
+  formula_cv <- as.formula(
+    paste("mean_pollution ~", paste(top_variables, collapse = " + "))
+  )
+  
+  # -------------------------
+  # OLS
+  # -------------------------
+  model_ols <- lm(formula_cv, data = train_df)
+  pred_ols <- predict(model_ols, newdata = test_df)
+  
+  # -------------------------
+  # Spatial Lag Model
+  # -------------------------
+  model_lag_cv <- tryCatch({
+    lagsarlm(formula_cv, data = train_df, listw = train_lw, zero.policy = TRUE)
+  }, error = function(e) {
+    cat("  Lag model failed:", conditionMessage(e), "\n")
+    return(NULL)
+  })
+  
+  pred_lag <- rep(NA_real_, nrow(test_df))
+  
+  if (!is.null(model_lag_cv)) {
+    tryCatch({
+      all_data <- rbind(train_data, test_data)
+      rownames(all_data) <- all_data$GSS_CODE
+      
+      all_nb <- poly2nb(all_data, queen = TRUE)
+      all_lw <- nb2listw(all_nb, style = "W", zero.policy = TRUE)
+      
+      lag_pred_all <- predict(
+        model_lag_cv,
+        newdata = st_drop_geometry(all_data),
+        listw = all_lw,
+        pred.type = "TS",
+        zero.policy = TRUE
+      )
+      
+      lag_pred_all <- as.numeric(lag_pred_all)
+      pred_lag <- tail(lag_pred_all, nrow(test_df))
+      
+    }, error = function(e) {
+      cat("  Lag prediction failed:", conditionMessage(e), "\n")
+      pred_lag <<- pred_ols
+    })
+  } else {
+    pred_lag <- pred_ols
+  }
+  
+  # -------------------------
+  # Spatial Error Model
+  # -------------------------
+  model_sem_cv <- tryCatch({
+    errorsarlm(formula_cv, data = train_df, listw = train_lw, zero.policy = TRUE)
+  }, error = function(e) {
+    cat("  SEM model failed:", conditionMessage(e), "\n")
+    return(NULL)
+  })
+  
+  pred_sem <- rep(NA_real_, nrow(test_df))
+  
+  if (!is.null(model_sem_cv)) {
+    tryCatch({
+      all_coefs <- coef(model_sem_cv)
+      
+      if (names(all_coefs)[1] == "lambda") {
+        beta <- all_coefs[-1]
+      } else if (tail(names(all_coefs), 1) == "lambda") {
+        beta <- all_coefs[-length(all_coefs)]
+      } else {
+        beta <- all_coefs
+      }
+      
+      X_test <- model.matrix(formula_cv, data = test_df)
+      beta_matched <- beta[colnames(X_test)]
+      pred_sem <- as.numeric(X_test %*% beta_matched)
+      
+    }, error = function(e) {
+      cat("  SEM prediction failed:", conditionMessage(e), "\n")
+      pred_sem <<- pred_ols
+    })
+  } else {
+    pred_sem <- pred_ols
+  }
+  
+  # Store results
+  observed <- test_df$mean_pollution
+  
+  cv_results <- rbind(
+    cv_results,
+    data.frame(
+      fold = fold,
+      model = "OLS",
+      observed = observed,
+      predicted = pred_ols,
+      test_size = length(test_idx)
+    ),
+    data.frame(
+      fold = fold,
+      model = "Spatial_Lag",
+      observed = observed,
+      predicted = pred_lag,
+      test_size = length(test_idx)
+    ),
+    data.frame(
+      fold = fold,
+      model = "Spatial_Error",
+      observed = observed,
+      predicted = pred_sem,
+      test_size = length(test_idx)
+    )
+  )
+}
+
+cat("\nSpatial CV completed.\n")
+
+# ------------------------------------------------------------
+# 15.3 CV summary metrics
+# ------------------------------------------------------------
+
+metrics_summary <- cv_results %>%
+  group_by(model) %>%
+  summarise(
+    RMSE = sqrt(mean((observed - predicted)^2, na.rm = TRUE)),
+    MAE = mean(abs(observed - predicted), na.rm = TRUE),
+    R2 = {
+      valid <- !is.na(predicted) & !is.na(observed)
+      obs <- observed[valid]
+      pred <- predicted[valid]
+      if (length(obs) < 10) NA else 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+    },
+    n_predictions = sum(!is.na(predicted)),
+    .groups = "drop"
+  ) %>%
+  arrange(RMSE)
+
+cat("\n========================================\n")
+cat("SPATIAL CV PERFORMANCE METRICS\n")
+cat("========================================\n")
+print(as.data.frame(metrics_summary), row.names = FALSE)
+
+# Optional export
+# write.csv(metrics_summary, "cv_metrics_pm25.csv", row.names = FALSE)
+
+# ============================================================
+# 16) CV DIAGNOSTIC PLOTS
+# ============================================================
+
+cv_results$residual <- cv_results$observed - cv_results$predicted
+
+p_cv <- ggplot(
+  cv_results %>% filter(!is.na(predicted)),
+  aes(x = observed, y = predicted, color = model)
+) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~model, ncol = 3) +
+  labs(
+    title = "Spatial Cross-Validation: Observed vs Predicted",
+    subtitle = sprintf("%d-Fold Spatial Block CV", n_folds),
+    x = "Observed log(PM2.5 + 1)",
+    y = "Predicted log(PM2.5 + 1)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_cv)
+
+p_resid <- ggplot(
+  cv_results %>% filter(!is.na(residual)),
+  aes(x = residual, fill = model)
+) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  facet_wrap(~model, ncol = 3, scales = "free_y") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Distributions (Spatial CV)",
+    x = "Residual (Observed - Predicted)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_resid)
+
+p_metrics <- metrics_summary %>%
+  select(model, RMSE, MAE) %>%
+  pivot_longer(cols = c(RMSE, MAE), names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = model, y = Value, fill = model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(
+    title = "Model Performance Comparison (Spatial CV)",
+    x = "Model",
+    y = "Error (log-scale units)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+print(p_metrics)
+
+
+
+Rscript for Portfolio IV
+# ==============================================================================
+# PORTFOLIO 4: SPATIAL INTERPOLATION AND MAPPING OF AIR POLLUTION
+# ==============================================================================
+# Objective: Interpolate and map PM2.5 concentrations across Greater London
+#            using different geostatistical techniques
+#
+# Methods: Regression Kriging, Ordinary Kriging, Cokriging, IDW
+# Author: WS 2025/26
+# ==============================================================================
+
+# Clear workspace
+rm(list = ls())
+
+# ==============================================================================
+# LOAD REQUIRED LIBRARIES
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("LOADING LIBRARIES\n")
+cat("========================================\n\n")
+
+required_packages <- c("sf", "sp", "terra", "gstat", "tmap", "dplyr",
+                      "ggplot2", "patchwork", "nlme", "caret", "tidyr", "gridExtra")
+
+for(pkg in required_packages) {
+  if(!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+cat("✓ All libraries loaded successfully\n\n")
+
+# ==============================================================================
+# TASK 1: DATA PREPARATION
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("TASK 1: DATA PREPARATION\n")
+cat("========================================\n\n")
+
+cat("Step 1.1: Loading spatial data...\n")
+
+# Import Greater London ward boundaries
+GreaterLondonWards <- st_read("H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/London-wards-2018/London_Ward/London_Ward.shp", quiet = TRUE)
+GreaterLondonBorough <- st_read("H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/LondonBorough/London_Borough_Excluding_MHW.shp", quiet = TRUE)
+
+# Import pollution grids
+PollutionGrid <- st_read("H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/LAEI2019-pm2-5-grid-emissions-all-sources/LAEI2019-pm2-5-grid-emissions-all-sources.shp", quiet = TRUE)
+NOxGrid <- st_read("H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/LAEI2019-nox-grid-emissions-all-sources/LAEI2019-nox-grid-emissions-all-sources.shp", quiet = TRUE)
+
+cat(sprintf("  ✓ Loaded %d wards\n", nrow(GreaterLondonWards)))
+cat(sprintf("  ✓ Loaded %d boroughs\n", nrow(GreaterLondonBorough)))
+cat(sprintf("  ✓ Loaded pollution grids\n\n"))
+
+# Step 1.2: Assign borough IDs to wards
+cat("Step 1.2: Assigning wards to boroughs...\n")
+
+Intersected <- st_join(GreaterLondonWards, GreaterLondonBorough)
+GreaterLondonWards <- Intersected %>%
+  group_by(GSS_CODE.x) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  st_as_sf()
+
+colnames(GreaterLondonWards)[colnames(GreaterLondonWards) == "GSS_CODE.x"] <- "GSS_CODE"
+colnames(GreaterLondonWards)[colnames(GreaterLondonWards) == "GSS_CODE.y"] <- "GSS_CODE.borough"
+
+cat("  ✓ Ward-borough assignment complete\n\n")
+
+# Step 1.3: Check and harmonize CRS
+cat("Step 1.3: Checking Coordinate Reference Systems...\n")
+cat(sprintf("  Ward CRS: %s\n", st_crs(GreaterLondonWards)$input))
+cat(sprintf("  Pollution CRS: %s\n", st_crs(PollutionGrid)$input))
+
+if (st_crs(GreaterLondonWards) != st_crs(PollutionGrid)) {
+  cat("  → Transforming pollution grids to match ward CRS...\n")
+  PollutionGrid <- st_transform(PollutionGrid, st_crs(GreaterLondonWards))
+  NOxGrid <- st_transform(NOxGrid, st_crs(GreaterLondonWards))
+}
+
+cat("  ✓ CRS harmonization complete\n\n")
+
+# Step 1.4: Calculate area-weighted mean pollution by ward
+cat("Step 1.4: Calculating area-weighted pollution concentrations...\n")
+
+# Spatial intersection PM2.5
+Intersected_PM25 <- st_intersection(GreaterLondonWards, PollutionGrid) %>%
+  mutate(intersect_area = st_area(.))
+
+WeightedPollution <- Intersected_PM25 %>%
+  group_by(GSS_CODE) %>%
+  summarize(mean_pollution = sum(all_2025 * as.numeric(intersect_area)) / sum(as.numeric(intersect_area))) %>%
+  st_drop_geometry()
+
+# Spatial intersection NOx
+Intersected_NOx <- st_intersection(GreaterLondonWards, NOxGrid) %>%
+  mutate(intersect_area = st_area(.))
+
+WeightedNOx <- Intersected_NOx %>%
+  group_by(GSS_CODE) %>%
+  summarize(mean_NOx = sum(all_2025 * as.numeric(intersect_area)) / sum(as.numeric(intersect_area))) %>%
+  st_drop_geometry()
+
+# Merge pollution data with wards
+GreaterLondonWards <- GreaterLondonWards %>%
+  left_join(WeightedPollution, by = "GSS_CODE") %>%
+  left_join(WeightedNOx, by = "GSS_CODE")
+
+cat(sprintf("  ✓ PM2.5 range: %.2f - %.2f\n",
+            min(GreaterLondonWards$mean_pollution, na.rm = TRUE),
+            max(GreaterLondonWards$mean_pollution, na.rm = TRUE)))
+cat(sprintf("  ✓ NOx range: %.2f - %.2f\n\n",
+            min(GreaterLondonWards$mean_NOx, na.rm = TRUE),
+            max(GreaterLondonWards$mean_NOx, na.rm = TRUE)))
+
+# Step 1.5: Visualize raw pollution data
+cat("Step 1.5: Creating initial pollution map...\n")
+
+tm_raw <- tm_shape(GreaterLondonWards) +
+  tm_polygons("mean_pollution",
+              palette = "YlOrRd",
+              title = "PM2.5 (μg/m³)",
+              border.col = "white",
+              border.lwd = 0.5) +
+  tm_layout(title = "PM2.5 Concentrations by Ward (Raw Data)",
+            legend.outside = TRUE)
+
+print(tm_raw)
+cat("  ✓ Initial map created\n\n")
+
+# Step 1.6: Apply log transformation
+cat("Step 1.6: Applying log transformation...\n")
+
+GreaterLondonWards$mean_pollution <- log1p(GreaterLondonWards$mean_pollution)
+GreaterLondonWards$mean_NOx <- log1p(GreaterLondonWards$mean_NOx)
+
+cat("  ✓ Log transformation applied (log1p)\n\n")
+
+# Step 1.7: Load socioeconomic data
+cat("Step 1.7: Loading socioeconomic data...\n")
+
+ward_data <- read.csv("H:/Uni/Uni_WS2025_26/geostatistics_2025_26/data/portfolio_2/ward-profiles-excel-version.csv",
+                     stringsAsFactors = FALSE)
+
+# Convert numeric columns
+ward_data[, 5:ncol(ward_data)] <- lapply(ward_data[, 5:ncol(ward_data)], function(x) {
+  as.numeric(gsub(",", "", as.character(x)))
+})
+
+# Filter for ward codes only (exclude borough codes)
+ward_data <- ward_data %>%
+  filter(grepl("^E050", New.code)) %>%
+  distinct(New.code, .keep_all = TRUE)
+
+cat(sprintf("  ✓ Loaded socioeconomic data: %d wards, %d variables\n\n",
+            nrow(ward_data), ncol(ward_data)))
+
+# Step 1.8: Merge all data
+cat("Step 1.8: Merging spatial and socioeconomic data...\n")
+
+merged_data <- GreaterLondonWards %>%
+  left_join(ward_data, by = c("GSS_CODE" = "New.code")) %>%
+  select(where(~ !all(is.na(.)))) %>%
+  na.omit()
+
+cat(sprintf("  ✓ Final dataset: %d wards with complete data\n", nrow(merged_data)))
+cat(sprintf("  ✓ Wards dropped due to missing data: %d\n\n",
+            nrow(GreaterLondonWards) - nrow(merged_data)))
+
+cat("✓ DATA PREPARATION COMPLETE\n\n")
+
+# ==============================================================================
+# TASK 2: GEOSTATISTICAL INTERPOLATION
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("TASK 2: GEOSTATISTICAL INTERPOLATION\n")
+cat("========================================\n\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.1: Identify Top Predictors
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Step 2.1: Identify Top Predictors
+# ------------------------------------------------------------------------------
+
+cat("Step 2.1: Identifying top predictors for PM2.5...\n")
+
+# Drop geometry first
+model_df <- st_drop_geometry(merged_data)
+
+# Keep only numeric columns
+numeric_cols <- sapply(model_df, is.numeric)
+numeric_data <- model_df[, numeric_cols]
+
+# Exclude response and obvious non-predictors
+exclude_vars <- c(
+  "mean_pollution",   # response (log-transformed PM2.5)
+  "mean_NOx",         # used later for cokriging
+  "mean_pollution_original"
+)
+
+candidate_vars <- setdiff(names(numeric_data), exclude_vars)
+
+# Compute correlations with response
+correlations <- sapply(candidate_vars, function(v) {
+  suppressWarnings(cor(model_df[[v]], model_df$mean_pollution, use = "complete.obs"))
+})
+
+# Remove NAs if any
+correlations <- correlations[!is.na(correlations)]
+
+# Rank by absolute correlation
+sorted_correlations <- sort(abs(correlations), decreasing = TRUE)
+
+# Select top predictors
+top_n <- 8
+top_variables <- names(sorted_correlations)[1:top_n]
+
+predictor_table <- data.frame(
+  Rank = 1:length(top_variables),
+  Variable = top_variables,
+  Correlation = round(correlations[top_variables], 3),
+  AbsCorrelation = round(abs(correlations[top_variables]), 3),
+  row.names = NULL
+)
+
+cat("\nTop Predictors:\n")
+print(predictor_table, row.names = FALSE)
+cat("\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.2: Create 50m Resolution Grid
+# ------------------------------------------------------------------------------
+
+cat("Step 2.2: Creating interpolation grid (50m resolution)...\n")
+# takes a long time, so use gridded version instead
+#grid_50m <- st_make_grid(merged_data,
+#                        cellsize = 50,
+#                        what = "centers") %>%
+#  st_as_sf(crs = st_crs(merged_data))
+
+# Clip to ward boundaries
+#grid_50m <- st_intersection(grid_50m, st_union(merged_data))
+load("grid_50m.Rdata")
+
+cat(sprintf("  ✓ Created grid with %d points\n\n", nrow(grid_50m)))
+
+# ------------------------------------------------------------------------------
+# Step 2.3: Linear Regression Model
+# ------------------------------------------------------------------------------
+
+cat("Step 2.3: Fitting linear regression model...\n")
+
+##why not lag or error model -> issue with following kriging: residual structure only keeps white noise -> need residuals that are still autocorrelated, which is why we use a simple linear model
+formula_lm <- as.formula(paste("mean_pollution ~", paste(top_variables, collapse = " + ")))
+model_lm <- lm(formula_lm, data = merged_data) # basic model
+
+cat("\nModel Summary:\n")
+cat("─────────────────────────────────────────\n")
+cat(sprintf("R² = %.4f\n", summary(model_lm)$r.squared))
+cat(sprintf("Adjusted R² = %.4f\n", summary(model_lm)$adj.r.squared))
+cat(sprintf("RMSE = %.4f\n", sqrt(mean(residuals(model_lm)^2))))
+cat("\n")
+summary(model_lm) # could think about excluding average public transport to make pop. density significant
+# for each borough we get an additional partial offset
+# ------------------------------------------------------------------------------
+# Step 2.4: Linear Mixed Effects Model (LME)
+# ------------------------------------------------------------------------------
+
+cat("Step 2.4: Fitting Linear Mixed Effects model...\n")
+
+# Back-transform for LME (works better on original scale)
+merged_data$mean_pollution_original <- exp(merged_data$mean_pollution) - 1
+
+formula_lme <- as.formula(paste("mean_pollution_original ~", paste(top_variables, collapse = " + ")))
+
+lme_model <- lme(
+  fixed = formula_lme,
+  random = ~ 1 | GSS_CODE.borough, # boroughs as random effect
+  data = merged_data,
+  weights = varPower(form = ~ mean_pollution)
+)
+
+cat("\nLME Model Summary:\n")
+cat("─────────────────────────────────────────\n")
+cat(sprintf("AIC = %.2f\n", AIC(lme_model)))
+cat(sprintf("BIC = %.2f\n", BIC(lme_model)))
+cat("\n")
+summary(lme_model)
+# StdDev:   0.3183106 0.4440142 that accounts for random effect
+#  power 1.647906 
+# ------------------------------------------------------------------------------
+# Step 2.5: Compare LM vs LME
+# ------------------------------------------------------------------------------
+
+cat("Step 2.5: Comparing LM vs LME models...\n\n")
+
+# Predictions
+merged_data$pred_lm <- predict(model_lm)
+merged_data$pred_lme_log <- log1p(predict(lme_model))
+
+# R² comparison
+r2_lm <- cor(merged_data$mean_pollution, merged_data$pred_lm)^2
+r2_lme <- cor(merged_data$mean_pollution, merged_data$pred_lme_log)^2
+
+cat("MODEL COMPARISON:\n")
+cat("═══════════════════════════════════════\n")
+cat(sprintf("Linear Model R²:       %.4f\n", r2_lm))
+cat(sprintf("Mixed Effects Model R²: %.4f\n", r2_lme))
+cat(sprintf("\nDifference:            %.4f\n", r2_lme - r2_lm))
+
+if(r2_lme > r2_lm) {
+  cat("\n→ LME model shows improvement (accounts for borough-level variation)\n")
+} else {
+  cat("\n→ LM model sufficient (borough effects minimal)\n")
+}
+cat("\n")
+
+# Use LME for further analysis (better performance with borough-level variation)
+final_regression_model <- lme_model
+cat("✓ Using Linear Mixed Effects Model for regression kriging\n\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.5b: LM vs LME Residual Diagnostics
+# ------------------------------------------------------------------------------
+
+cat("Step 2.5b: Creating LM vs LME residual diagnostics...\n")
+
+# LM predictions/residuals on log scale
+merged_data$pred_lm <- predict(model_lm)
+merged_data$resid_lm <- merged_data$mean_pollution - merged_data$pred_lm
+
+# LME predictions/residuals on log scale
+# LME predicts on original scale, so transform back to log scale
+merged_data$pred_lme_log <- log1p(predict(lme_model))
+merged_data$resid_lme <- merged_data$mean_pollution - merged_data$pred_lme_log
+
+# Diagnostic data frame
+diag_df <- st_drop_geometry(merged_data) %>%
+  dplyr::select(mean_pollution, pred_lm, pred_lme_log, resid_lm, resid_lme) %>%
+  tidyr::pivot_longer(
+    cols = c(pred_lm, pred_lme_log),
+    names_to = "Model_pred",
+    values_to = "Predicted"
+  ) %>%
+  mutate(
+    Model = ifelse(Model_pred == "pred_lm", "LM", "LME")
+  )
+
+resid_df <- st_drop_geometry(merged_data) %>%
+  dplyr::select(pred_lm, pred_lme_log, resid_lm, resid_lme) %>%
+  mutate(row_id = row_number()) %>%
+  tidyr::pivot_longer(
+    cols = c(pred_lm, pred_lme_log, resid_lm, resid_lme),
+    names_to = "Variable",
+    values_to = "Value"
+  )
+
+# Histogram of residuals
+p_hist_lm_lme <- ggplot(
+  st_drop_geometry(merged_data) %>%
+    dplyr::select(resid_lm, resid_lme) %>%
+    tidyr::pivot_longer(cols = everything(), names_to = "Model", values_to = "Residual"),
+  aes(x = Residual, fill = Model)
+) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  facet_wrap(~Model, scales = "free_y") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residual Distributions: LM vs LME",
+    x = "Residual",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+print(p_hist_lm_lme)
+
+# Residuals vs fitted
+p_resid_fit_lm_lme <- ggplot(
+  data.frame(
+    Model = rep(c("LM", "LME"), each = nrow(merged_data)),
+    Fitted = c(merged_data$pred_lm, merged_data$pred_lme_log),
+    Residual = c(merged_data$resid_lm, merged_data$resid_lme)
+  ),
+  aes(x = Fitted, y = Residual)
+) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~Model) +
+  labs(
+    title = "Residuals vs Fitted: LM vs LME",
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+
+print(p_resid_fit_lm_lme)
+
+# Observed vs fitted
+p_obs_fit_lm_lme <- ggplot(
+  data.frame(
+    Model = rep(c("LM", "LME"), each = nrow(merged_data)),
+    Observed = rep(merged_data$mean_pollution, 2),
+    Fitted = c(merged_data$pred_lm, merged_data$pred_lme_log)
+  ),
+  aes(x = Observed, y = Fitted)
+) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~Model) +
+  labs(
+    title = "Observed vs Fitted: LM vs LME",
+    x = "Observed log(PM2.5 + 1)",
+    y = "Fitted log(PM2.5 + 1)"
+  ) +
+  theme_minimal()
+
+print(p_obs_fit_lm_lme)
+
+grid.arrange(p_hist_lm_lme, p_resid_fit_lm_lme, p_obs_fit_lm_lme, ncol=2)
+
+cat("  ✓ LM vs LME diagnostic plots created\n\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.5c: LM vs LME comparison table
+# ------------------------------------------------------------------------------
+
+lm_lme_comparison <- data.frame(
+  Model = c("Linear Model", "Linear Mixed Effects Model"),
+  R2 = c(
+    cor(merged_data$mean_pollution, merged_data$pred_lm)^2,
+    cor(merged_data$mean_pollution, merged_data$pred_lme_log)^2
+  ),
+  RMSE = c(
+    sqrt(mean((merged_data$mean_pollution - merged_data$pred_lm)^2)),
+    sqrt(mean((merged_data$mean_pollution - merged_data$pred_lme_log)^2))
+  ),
+  MAE = c(
+    mean(abs(merged_data$mean_pollution - merged_data$pred_lm)),
+    mean(abs(merged_data$mean_pollution - merged_data$pred_lme_log))
+  )
+)
+
+cat("LM vs LME COMPARISON:\n")
+print(lm_lme_comparison, row.names = FALSE)
+cat("\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.6: Regression Kriging
+# ------------------------------------------------------------------------------
+
+cat("Step 2.6: Performing Regression Kriging...\n")
+
+# Compute residuals (LME predicts on original scale, so log-transform first)
+merged_data$trend_lme <- log1p(predict(final_regression_model))
+merged_data$residuals <- merged_data$mean_pollution - merged_data$trend_lme
+
+# Convert to point data (centroids)
+merged_data_centroids <- merged_data %>%
+  st_centroid()
+
+# Fit variogram to residuals
+cat("  → Fitting variogram to residuals...\n")
+
+bbox <- st_bbox(merged_data)
+max_distance <- sqrt((bbox["xmax"] - bbox["xmin"])^2 + (bbox["ymax"] - bbox["ymin"])^2)
+cutoff <- max_distance / 3
+
+residual_variogram <- variogram(residuals ~ 1,
+                                locations = merged_data_centroids,
+                                cutoff = cutoff)
+residual_variogram_fit <- fit.variogram(residual_variogram, model = vgm("Sph"))
+
+cat(sprintf("  ✓ Variogram fitted (nugget=%.4f, sill=%.4f, range=%.0fm)\n",
+            residual_variogram_fit$psill[1],
+            residual_variogram_fit$psill[2],
+            residual_variogram_fit$range[2]))
+
+# Plot variogram
+plot(residual_variogram, residual_variogram_fit,
+     main = "Residual Variogram for Regression Kriging",
+     xlab = "Distance (m)", ylab = "Semivariance")
+# up to 5000m we see autocorr. of residuals (is needed), eventually similarity increases again (possibly isotropic effect?)
+# amount of spat. corr. is relatively small but there
+
+# Predict trend at observation locations (ward centroids)
+cat("  → Predicting trend component at ward centroids...\n")
+# LME predicts on original scale, log-transform to match data scale
+merged_data_centroids$trend_pred <- log1p(predict(final_regression_model))
+
+# Fit variogram to trend predictions
+# predictions for each grid-cell
+cat("  → Fitting variogram to trend predictions...\n")
+trend_variogram <- variogram(trend_pred ~ 1,
+                            locations = merged_data_centroids,
+                            cutoff = cutoff)
+trend_variogram_fit <- fit.variogram(trend_variogram, model = vgm("Sph"))
+
+cat(sprintf("  ✓ Trend variogram fitted (nugget=%.4f, sill=%.4f, range=%.0fm)\n",
+            trend_variogram_fit$psill[1],
+            trend_variogram_fit$psill[2],
+            trend_variogram_fit$range[2]))
+
+# Krige trend surface to grid
+cat("  → Kriging trend surface to grid...\n")
+trend_kriging <- krige(trend_pred ~ 1,
+                      merged_data_centroids,
+                      grid_50m,
+                      trend_variogram_fit,
+                      nmax = 50)
+grid_50m$trend_pred <- trend_kriging$var1.pred
+
+# kriging for model residuals
+# Krige residuals to grid
+cat("  → Kriging residuals to grid...\n")
+residual_kriging <- krige(residuals ~ 1,
+                          merged_data_centroids,
+                          grid_50m,
+                          residual_variogram_fit,
+                          nmax = 50)
+
+# Combine kriged trend + kriged residuals
+grid_50m$regression_kriging <- grid_50m$trend_pred + residual_kriging$var1.pred
+
+cat("  ✓ Regression Kriging complete\n\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.7: Ordinary Kriging
+# ------------------------------------------------------------------------------
+
+cat("Step 2.7: Performing Ordinary Kriging...\n")
+
+#for centroids of wards, treat it all as stochastic
+# Fit variogram to PM2.5 directly
+variogram_ok <- variogram(mean_pollution ~ 1,
+                         locations = merged_data_centroids,
+                         cutoff = cutoff)
+variogram_ok_fit <- fit.variogram(variogram_ok, model = vgm("Sph"))
+
+cat(sprintf("  ✓ Variogram fitted (nugget=%.4f, sill=%.4f, range=%.0fm)\n",
+            variogram_ok_fit$psill[1],
+            variogram_ok_fit$psill[2],
+            variogram_ok_fit$range[2]))
+
+# Plot variogram
+plot(variogram_ok, variogram_ok_fit,
+     main = "Variogram for Ordinary Kriging",
+     xlab = "Distance (m)", ylab = "Semivariance")
+
+# Perform kriging
+ok_result <- krige(mean_pollution ~ 1,
+                   merged_data_centroids,
+                   grid_50m,
+                   variogram_ok_fit,
+                   nmax = 50)
+str(ok_result) # use var1.var for visualisation!!!
+
+grid_50m$ordinary_kriging <- ok_result$var1.pred
+
+cat("  ✓ Ordinary Kriging complete\n\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.8: Cokriging (with NOx as covariate)
+# ------------------------------------------------------------------------------
+
+cat("Step 2.8: Performing Cokriging (PM2.5 with NOx)...\n")
+
+# sample variogram pollution
+# Create gstat object
+g <- gstat(id = "mean_pollution",
+           formula = mean_pollution ~ 1,
+           data = merged_data_centroids)
+
+# sample variogram pollution
+# 2nd one just added
+g <- gstat(g,
+           id = "mean_NOx",
+           formula = mean_NOx ~ 1,
+           data = merged_data_centroids)
+
+# sample cross variogram
+# Fit variograms
+cat("  → Computing cross-variograms...\n")
+variogram_cok <- variogram(g, cutoff = cutoff)
+
+# Define initial models
+initial_model <- vgm(psill = 0.05, model = "Sph", range = 15000, nugget = 0.01) # params are modified later, but we need starting params
+
+g <- gstat(g, id = "mean_pollution", model = initial_model)
+g <- gstat(g, id = "mean_NOx", model = initial_model)
+
+# Cross-variogram
+cross_model <- vgm(psill = 0.04, model = "Sph", range = 15000, nugget = 0.01)
+g <- gstat(g, id = c("mean_pollution", "mean_NOx"), model = cross_model)
+
+# Fit Linear Model of Coregionalization
+cat("  → Fitting Linear Model of Coregionalization...\n")
+lmc_model <- fit.lmc(variogram_cok, g)
+
+# Perform cokriging
+cat("  → Predicting to grid...\n")
+cokriging_result <- predict(lmc_model, newdata = grid_50m) #automatically uses cokriging
+
+grid_50m$cokriging <- cokriging_result$mean_pollution.pred
+
+cat("  ✓ Cokriging complete\n\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.9: Inverse Distance Weighting (IDW)
+# ------------------------------------------------------------------------------
+
+cat("Step 2.9: Performing Inverse Distance Weighting...\n")
+
+idw_result <- idw(mean_pollution ~ 1,
+                  merged_data_centroids,
+                  grid_50m,
+                  idp = 2,
+                  nmax = 50) # max. neigboring values
+
+grid_50m$idw <- idw_result$var1.pred
+
+cat("  ✓ IDW complete\n\n")
+
+cat("✓ GEOSTATISTICAL INTERPOLATION COMPLETE\n\n")
+
+# ==============================================================================
+# TASK 3: MAPPING AND VISUALIZATION
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("TASK 3: MAPPING AND VISUALIZATION\n")
+cat("========================================\n\n")
+
+cat("Creating thematic maps for all interpolation methods...\n\n")
+
+# Convert grid to raster for better visualization
+grid_vect <- vect(grid_50m)
+r_template <- rast(ext(grid_vect), resolution = 50, crs = crs(grid_vect))
+
+r_rk <- rasterize(grid_vect, r_template, field = "regression_kriging")
+r_ok <- rasterize(grid_vect, r_template, field = "ordinary_kriging")
+r_cok <- rasterize(grid_vect, r_template, field = "cokriging")
+r_idw <- rasterize(grid_vect, r_template, field = "idw")
+
+# Create maps
+map_rk <- tm_shape(r_rk) +
+  tm_raster(title = "log(PM2.5)", palette = "YlOrRd", style = "cont") +
+  tm_layout(title = "Regression Kriging", legend.outside = TRUE)
+
+map_ok <- tm_shape(r_ok) +
+  tm_raster(title = "log(PM2.5)", palette = "YlOrRd", style = "cont") +
+  tm_layout(title = "Ordinary Kriging", legend.outside = TRUE)
+
+map_cok <- tm_shape(r_cok) +
+  tm_raster(title = "log(PM2.5)", palette = "YlOrRd", style = "cont") +
+  tm_layout(title = "Cokriging (with NOx)", legend.outside = TRUE)
+
+map_idw <- tm_shape(r_idw) +
+  tm_raster(title = "log(PM2.5)", palette = "YlOrRd", style = "cont") +
+  tm_layout(title = "Inverse Distance Weighting", legend.outside = TRUE)
+
+# Display all maps
+print(tmap_arrange(map_rk, map_ok, map_cok, map_idw, ncol = 2))
+
+cat("✓ Maps created and displayed\n\n")
+
+### regress. , ord. and cokriging similar, IDW worse with bullseye effect
+# -> now check performance with crossvalidation
+
+# ==============================================================================
+# TASK 4: CROSS-VALIDATION
+# ==============================================================================
+
+cat("\n========================================\n")
+cat("TASK 4: CROSS-VALIDATION (10-FOLD)\n")
+cat("========================================\n\n")
+
+cat("Performing 10-fold cross-validation for all methods...\n\n")
+
+# Convert to centroids for point-based methods
+merged_data_cv <- merged_data %>%
+  st_centroid()
+
+# Create 10 folds
+set.seed(42)
+folds <- createFolds(merged_data_cv$mean_pollution, k = 10, list = TRUE)
+
+# Initialize storage
+cv_results <- data.frame(
+  Method = character(),
+  Observed = numeric(),
+  Predicted = numeric(),
+  Fold = integer()
+)
+
+# ------------------------------------------------------------------------------
+# CV Loop
+# ------------------------------------------------------------------------------
+
+for(fold_i in seq_along(folds)) {
+  cat(sprintf("  Processing fold %d/%d...\n", fold_i, length(folds)))
+
+  test_idx <- folds[[fold_i]]
+  train_idx <- setdiff(1:nrow(merged_data_cv), test_idx)
+
+  training <- merged_data_cv[train_idx, ]
+  testing <- merged_data_cv[test_idx, ]
+
+  training_df <- st_drop_geometry(training)
+  testing_df <- st_drop_geometry(testing)
+
+  # 1) Regression Kriging (using LME)
+  # Back-transform for LME
+  training_df$mean_pollution_original <- exp(training_df$mean_pollution) - 1
+
+  # Fit LME model
+  model_fold <- lme(
+    fixed = formula_lme,
+    random = ~ 1 | GSS_CODE.borough,
+    data = training_df,
+    weights = varPower(form = ~ mean_pollution)
+  )
+
+  # Predict trend and compute residuals (log-transform LME predictions)
+  training$trend_pred_fold <- log1p(predict(model_fold, training_df))
+  training$residuals_fold <- training$mean_pollution - training$trend_pred_fold
+
+  # Krige trend predictions to test locations
+  vgm_trend_fold <- variogram(trend_pred_fold ~ 1, locations = training, cutoff = cutoff)
+  vgm_trend_fold_fit <- fit.variogram(vgm_trend_fold, model = vgm("Sph"))
+  kriged_trend <- krige(trend_pred_fold ~ 1, training, testing, vgm_trend_fold_fit, nmax = 50)
+
+  # Krige residuals to test locations
+  vgm_resid_fold <- variogram(residuals_fold ~ 1, locations = training, cutoff = cutoff)
+  vgm_resid_fold_fit <- fit.variogram(vgm_resid_fold, model = vgm("Sph"))
+  kriged_resid <- krige(residuals_fold ~ 1, training, testing, vgm_resid_fold_fit, nmax = 50)
+
+  # Combine kriged trend + kriged residuals
+  pred_rk <- kriged_trend$var1.pred + kriged_resid$var1.pred
+
+  # 2) Ordinary Kriging
+  vgm_ok_fold <- variogram(mean_pollution ~ 1, locations = training, cutoff = cutoff)
+  vgm_ok_fold_fit <- fit.variogram(vgm_ok_fold, model = vgm("Sph"))
+
+  kriged_ok <- krige(mean_pollution ~ 1, training, testing, vgm_ok_fold_fit, nmax = 50)
+  pred_ok <- kriged_ok$var1.pred
+
+  # 3) Cokriging (with NOx)
+  g_fold <- gstat(id = "mean_pollution",
+                  formula = mean_pollution ~ 1,
+                  data = training)
+  g_fold <- gstat(g_fold,
+                  id = "mean_NOx",
+                  formula = mean_NOx ~ 1,
+                  data = training)
+
+  vgm_cok_fold <- variogram(g_fold, cutoff = cutoff)
+
+  initial_model_fold <- vgm(psill = 0.05, model = "Sph", range = 15000, nugget = 0.01)
+  g_fold <- gstat(g_fold, id = "mean_pollution", model = initial_model_fold)
+  g_fold <- gstat(g_fold, id = "mean_NOx", model = initial_model_fold)
+
+  cross_model_fold <- vgm(psill = 0.04, model = "Sph", range = 15000, nugget = 0.01)
+  g_fold <- gstat(g_fold, id = c("mean_pollution", "mean_NOx"), model = cross_model_fold)
+
+  lmc_fold <- fit.lmc(vgm_cok_fold, g_fold)
+  cokriging_fold <- predict(lmc_fold, newdata = testing)
+  pred_cok <- cokriging_fold$mean_pollution.pred
+
+  # 4) IDW
+  idw_fold <- idw(mean_pollution ~ 1, training, testing, idp = 2, nmax = 50)
+  pred_idw <- idw_fold$var1.pred
+
+  # Store results
+  cv_results <- rbind(cv_results,
+    data.frame(Method = "Regression_Kriging",
+               Observed = testing$mean_pollution,
+               Predicted = pred_rk,
+               Fold = fold_i),
+    data.frame(Method = "Ordinary_Kriging",
+               Observed = testing$mean_pollution,
+               Predicted = pred_ok,
+               Fold = fold_i),
+    data.frame(Method = "Cokriging",
+               Observed = testing$mean_pollution,
+               Predicted = pred_cok,
+               Fold = fold_i),
+    data.frame(Method = "IDW",
+               Observed = testing$mean_pollution,
+               Predicted = pred_idw,
+               Fold = fold_i)
+  )
+}
+
+cat("\n✓ Cross-validation complete\n\n")
+
+# ------------------------------------------------------------------------------
+# Calculate CV Metrics
+# ------------------------------------------------------------------------------
+
+# we expect IDW to be less powerful than the other ones, otherwise quite similar results could be expected for the performance
+
+cat("CROSS-VALIDATION RESULTS:\n")
+cat("═══════════════════════════════════════\n\n")
+
+cv_metrics <- cv_results %>%
+  group_by(Method) %>%
+  summarise(
+    RMSE = sqrt(mean((Observed - Predicted)^2)),
+    MAE = mean(abs(Observed - Predicted)),
+    R2 = cor(Observed, Predicted)^2,
+    Bias = mean(Predicted - Observed),
+    .groups = "drop"
+  ) %>%
+  arrange(RMSE)
+
+print(as.data.frame(cv_metrics), row.names = FALSE, digits = 4)
+
+# ordinary kriging seems to be the best; loewst RMSE, MAE, r2
+
+cat("\n")
+
+# ------------------------------------------------------------------------------
+# Visualization of CV Results
+# ------------------------------------------------------------------------------
+
+cat("\nCreating cross-validation diagnostic plots...\n\n")
+
+# Observed vs Predicted
+p_cv <- ggplot(cv_results, aes(x = Observed, y = Predicted, color = Method)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~Method, ncol = 3) +
+  labs(title = "10-Fold Cross-Validation: Observed vs Predicted",
+       x = "Observed log(PM2.5 + 1)",
+       y = "Predicted log(PM2.5 + 1)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(p_cv)
+
+# res. for ordinary kriging good enough, stronger bias can be seen in IDW
+
+# Residual distributions
+cv_results$Residual <- cv_results$Observed - cv_results$Predicted
+
+p_resid <- ggplot(cv_results, aes(x = Residual, fill = Method)) +
+  geom_histogram(bins = 30, alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~Method, ncol = 3, scales = "free_y") +
+  labs(title = "Cross-Validation Residual Distributions",
+       x = "Residual (Observed - Predicted)",
+       y = "Frequency") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(p_resid)
+
+# ==============================================================================
+# FINAL SUMMARY AND RECOMMENDATIONS
+# ==============================================================================
+
+cat("\n╔════════════════════════════════════════╗\n")
+cat("║         FINAL SUMMARY                ║\n")
+cat("╚════════════════════════════════════════╝\n\n")
+
+best_method <- cv_metrics$Method[1]
+
+cat("✓ BEST PERFORMING METHOD:\n")
+cat("─────────────────────────────────────────\n")
+cat(sprintf("Method: %s\n", best_method))
+cat(sprintf("CV RMSE: %.4f\n", cv_metrics$RMSE[1]))
+cat(sprintf("CV R²:   %.4f\n", cv_metrics$R2[1]))
+cat(sprintf("CV MAE:  %.4f\n\n", cv_metrics$MAE[1]))
+
+cat("✓ METHOD COMPARISON:\n")
+cat("─────────────────────────────────────────\n")
+for(i in 1:nrow(cv_metrics)) {
+  cat(sprintf("%d. %-20s RMSE=%.4f  R²=%.4f\n",
+              i, cv_metrics$Method[i], cv_metrics$RMSE[i], cv_metrics$R2[i]))
+}
+
+cat("\n✓ KEY FINDINGS:\n")
+cat("─────────────────────────────────────────\n")
+cat("• Regression Kriging incorporates socioeconomic predictors\n")
+cat("• Ordinary Kriging relies solely on spatial structure\n")
+cat("• Cokriging leverages correlation with NOx concentrations\n")
+cat("• IDW is simplest but may miss local variations\n")
+cat("• Cross-validation provides realistic performance estimates\n")
+
+cat("\n✓ RECOMMENDATIONS:\n")
+cat("─────────────────────────────────────────\n")
+cat(sprintf("• Use %s for final predictions\n", best_method))
+cat("• Consider ensemble approach combining top methods\n")
+cat("• Account for uncertainty in policy decisions\n")
+cat("• Validate with held-out monitoring stations if available\n")
+
+cat("\n╔════════════════════════════════════════╗\n")
+cat("║      ANALYSIS COMPLETE! ✓            ║\n")
+cat("╚════════════════════════════════════════╝\n\n")
+
+
