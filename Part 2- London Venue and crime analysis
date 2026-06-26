@@ -1,0 +1,1006 @@
+# SPATIAL CLUSTERING ANALYSIS - STUDENT TEMPLATE
+# ========================================
+
+rm(list = ls())
+
+# Load required libraries
+library(sf)
+library(spdep)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ClustGeo)
+library(cluster)
+library(randomForest)
+library(tmap)
+
+#setwd("D:/Geostatistics/Geostatistic/data")
+
+## ========================================
+# STEP 1: Load and Prepare Data
+# ========================================
+
+# Load spatial data
+wards <- st_read("D:/Geoinformatic/Geostatistic/Data/London_Ward/London_Ward.shp") %>%
+  st_transform(27700)
+
+# Load crime and venue data
+load("Venue.Rdata")
+venues_sf <- st_as_sf(df_bng, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(27700)
+
+load("Crime_06_2024.Rdata")
+crimes_sf <- st_as_sf(all_crimes, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(27700)
+
+# Filter relevant types
+selected_crimes <- c("violent-crime", "burglary", "anti-social-behaviour")
+selected_venues <- c("Pub", "Restaurant", "Fast Food", "Café", "Bar")
+
+crimes_subset <- crimes_sf[crimes_sf$category %in% selected_crimes, ]
+venues_subset <- venues_sf[venues_sf$category %in% selected_venues, ]
+
+# Aggregate to ward level
+crimes_in_wards <- st_join(crimes_subset, wards, join = st_within)
+venues_in_wards <- st_join(venues_subset, wards, join = st_within)
+
+total_crimes <- crimes_in_wards %>%
+  st_drop_geometry() %>%
+  group_by(GSS_CODE) %>%
+  summarise(total_crimes = n(), .groups = "drop")
+
+total_venues <- venues_in_wards %>%
+  st_drop_geometry() %>%
+  group_by(GSS_CODE) %>%
+  summarise(total_venues = n(), .groups = "drop")
+
+# Merge and calculate densities
+wards_data <- wards %>%
+  left_join(total_crimes, by = "GSS_CODE") %>%
+  left_join(total_venues, by = "GSS_CODE") %>%
+  mutate(
+    total_crimes = replace_na(total_crimes, 0),
+    total_venues = replace_na(total_venues, 0),
+    area_km2 = as.numeric(st_area(.)) / 1e6,
+    crime_density = total_crimes / area_km2,
+    venue_density = total_venues / area_km2
+  )
+
+# ========================================
+# STEP 2: Load Socioeconomic Data
+# ========================================
+
+# Load ward profile data
+ward_profiles <- read.csv("ward-profiles-excel-version.csv", stringsAsFactors = FALSE)
+
+# Select relevant columns
+ward_profiles_clean <- ward_profiles %>%
+  dplyr::select(
+    GSS_CODE = New.code,
+    median_income = Median.Household.income.estimate..2012.13.,
+    deprivation_rank = X.ID2010....Rank.of.average.score..within.London....2010,
+    ptal_score = Average.Public.Transport.Accessibility.score...2014,
+    pop_density = Population.density..persons.per.sq.km....2013,
+    pct_flats = X..Flat..maisonette.or.apartment...2011,
+    median_age = Median.Age...2013
+  ) %>%
+  mutate(
+    across(c(median_income, deprivation_rank, ptal_score, pop_density, pct_flats, median_age),
+           ~{
+             x <- gsub("[, ]", "", as.character(.))
+             x <- gsub("^(NA|N/A|n/a|-|\\*|\\.)$", NA, x)
+             suppressWarnings(as.numeric(x))
+           })
+  )
+
+# Join to wards data
+wards_data <- wards_data %>%
+  left_join(ward_profiles_clean, by = "GSS_CODE")
+
+# ========================================
+# STEP 3: Prepare Clustering Variables
+# ========================================
+
+# Select variables for clustering
+clustering_vars <- c("crime_density", "venue_density",
+                     "median_income", "ptal_score",
+                     "pop_density", "median_age")
+
+# Remove rows with missing values
+cluster_data <- wards_data %>%
+  st_drop_geometry() %>%
+  dplyr::select(GSS_CODE, all_of(clustering_vars)) %>%
+  filter(complete.cases(.))
+
+cat(sprintf("\nClustering dataset: %d wards × %d variables\n",
+            nrow(cluster_data), length(clustering_vars)))
+
+# Standardize variables
+cluster_matrix <- cluster_data %>%
+  dplyr::select(-GSS_CODE) %>%
+  scale()
+
+rownames(cluster_matrix) <- cluster_data$GSS_CODE
+
+# ========================================
+# STEP 4: Calculate Distance Matrices
+# ========================================
+
+# D0: Attribute distance (how similar are the crime/socioeconomic characteristics?)
+D0 <- dist(cluster_matrix)
+
+# D1: Geographic distance (how close are wards spatially?)
+centroids <- st_centroid(st_geometry(wards_data[wards_data$GSS_CODE %in% cluster_data$GSS_CODE, ]))
+D1 <- dist(st_coordinates(centroids))
+
+cat("\n✓ Distance matrices calculated\n")
+
+# ========================================
+# STEP 5: Determine Optimal Number of Clusters (k)
+# ========================================
+
+cat("\nSTEP 5: Finding optimal number of clusters...\n")
+
+k_values <- 2:8
+within_ss <- numeric(length(k_values))
+avg_sil <- numeric(length(k_values))
+
+for(i in seq_along(k_values)) {
+  k <- k_values[i]
+  tree <- hclustgeo(D0, D1, alpha = 0.3)
+  clusters <- cutree(tree, k = k)
+
+  # Within-cluster sum of squares
+  within_ss[i] <- sum(tapply(1:nrow(cluster_matrix), clusters, function(idx) {
+    if(length(idx) > 1) sum(dist(cluster_matrix[idx, ])^2) else 0
+  }))
+
+  # Silhouette width
+  sil <- silhouette(clusters, D0)
+  avg_sil[i] <- mean(sil[, 3])
+}
+
+# Visualize
+par(mfrow = c(1, 2))
+plot(k_values, within_ss, type = "b", pch = 19, col = "blue",
+     xlab = "Number of Clusters (k)", ylab = "Within-SS", main = "Elbow Method")
+abline(v = 4, col = "red", lty = 2)
+
+plot(k_values, avg_sil, type = "b", pch = 19, col = "green",
+     xlab = "Number of Clusters (k)", ylab = "Avg Silhouette", main = "Silhouette")
+abline(v = 4, col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+k_optimal <- 4
+cat(sprintf("\n✓ Optimal k = %d\n", k_optimal))
+
+# ========================================
+# STEP 6: Determine Optimal Spatial Constraint (alpha)
+# ========================================
+
+cat("\nSTEP 6: Finding optimal alpha...\n")
+cat("  α = 0.0 → Pure attribute clustering\n")
+cat("  α = 1.0 → Pure geographic clustering\n")
+
+alphas <- seq(0, 1, by = 0.1)
+quality_data <- numeric(length(alphas))
+quality_space <- numeric(length(alphas))
+
+for(i in seq_along(alphas)) {
+  tree <- hclustgeo(D0, D1, alpha = alphas[i])
+  clusters <- cutree(tree, k = k_optimal)
+
+  sil_data <- silhouette(clusters, D0)
+  quality_data[i] <- mean(sil_data[, 3])
+
+  sil_space <- silhouette(clusters, D1)
+  quality_space[i] <- mean(sil_space[, 3])
+}
+
+# Visualize trade-off
+plot(alphas, quality_data, type = "l", col = "blue", lwd = 2,
+     xlab = "Alpha", ylab = "Quality", main = "Data vs Spatial Quality",
+     ylim = c(0, max(c(quality_data, quality_space))))
+lines(alphas, quality_space, col = "green", lwd = 2)
+abline(v = 0.3, lty = 2, col = "red")
+legend("topright", legend = c("Data Quality", "Spatial Quality"),
+       col = c("blue", "green"), lwd = 2)
+
+alpha_optimal <- 0.3
+cat(sprintf("\n✓ Optimal α = %.1f\n", alpha_optimal))
+
+# ========================================
+# STEP 7: Create Final Clusters
+# ========================================
+
+cat("\nSTEP 7: Creating final clusters...\n")
+
+# Filter wards to only those with complete data
+wards_final <- wards_data %>%
+  filter(GSS_CODE %in% cluster_data$GSS_CODE)
+
+# Standard clustering (no spatial constraint)
+tree_standard <- hclust(D0, method = "ward.D2")
+wards_final$Cluster_Standard <- as.factor(cutree(tree_standard, k = k_optimal))
+
+# Spatially constrained clustering
+tree_spatial <- hclustgeo(D0, D1, alpha = alpha_optimal)
+wards_final$Cluster_Spatial <- as.factor(cutree(tree_spatial, k = k_optimal))
+
+cat("✓ Clusters created\n")
+
+
+# ========================================
+# STEP 8: Visualize Comparison
+# ========================================
+
+cat("\nSTEP 8: Creating comparison maps...\n")
+
+# Map 1: Standard clustering
+m_standard <- tm_shape(wards_final) +
+  tm_polygons("Cluster_Standard",
+              palette = "Accent",
+              title = "Cluster ID") +
+  tm_layout(main.title = "Standard Clustering (α=0)",
+            legend.position = c("left", "bottom"))
+
+# Map 2: Spatially constrained
+m_spatial <- tm_shape(wards_final) +
+  tm_polygons("Cluster_Spatial",
+              palette = "Accent",
+              title = "Cluster ID") +
+  tm_layout(main.title = "Spatially Constrained (α=0.3)",
+            legend.position = c("left", "bottom"))
+
+print(tmap_arrange(m_standard, m_spatial, ncol = 2))
+
+# ========================================
+# STEP 9A: Characterize Clusters
+# ========================================
+
+cat("\nSTEP 9: Characterizing clusters...\n")
+
+cluster_profile <- wards_final %>%
+  st_drop_geometry() %>%
+  group_by(Cluster_Spatial) %>%
+  summarise(
+    N_Wards = n(),
+    Avg_Crime_Density = round(mean(crime_density, na.rm = TRUE), 1),
+    Avg_Venue_Density = round(mean(venue_density, na.rm = TRUE), 1),
+    Avg_Median_Income = round(mean(median_income, na.rm = TRUE), 0),
+    Avg_PTAL = round(mean(ptal_score, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Avg_Crime_Density))
+
+cat("\nCLUSTER PROFILES:\n")
+print(cluster_profile)
+
+
+# ========================================
+# STEP 9B: PCA Validation using Boxplots
+# ========================================
+
+cat("\nSTEP 7A: PCA validation using boxplots...\n")
+
+# Run PCA on standardized variables
+pca_res <- prcomp(cluster_matrix, center = TRUE, scale. = TRUE)
+
+# Create PCA dataframe (first 3 PCs are enough)
+pca_df <- data.frame(
+  GSS_CODE = rownames(cluster_matrix),
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  PC3 = pca_res$x[, 3]
+)
+
+# Join cluster labels
+pca_df <- pca_df %>%
+  left_join(
+    wards_final %>%
+      st_drop_geometry() %>%
+      dplyr::select(GSS_CODE, Cluster_Spatial),
+    by = "GSS_CODE"
+  ) %>%
+  mutate(Cluster_Spatial = factor(Cluster_Spatial))
+
+# Variance explained
+pc_var <- summary(pca_res)$importance[2, ] * 100
+
+# Convert to long format for plotting
+pca_long <- pca_df %>%
+  pivot_longer(
+    cols = starts_with("PC"),
+    names_to = "Component",
+    values_to = "Score"
+  )
+
+# PCA boxplot
+p_pca_box <- ggplot(pca_long,
+                    aes(x = Cluster_Spatial, y = Score, fill = Cluster_Spatial)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "black") +
+  facet_wrap(~ Component, scales = "free_y",
+             labeller = labeller(Component = c(
+               PC1 = paste0("PC1 (", round(pc_var[1], 1), "%)"),
+               PC2 = paste0("PC2 (", round(pc_var[2], 1), "%)"),
+               PC3 = paste0("PC3 (", round(pc_var[3], 1), "%)")
+             ))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribution of Principal Component Scores by Spatial Cluster",
+    x = "Spatial Cluster",
+    y = "PCA Score"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_pca_box)
+ggsave("pca_boxplots_by_cluster.png", p_pca_box, width = 10, height = 6, dpi = 300)
+
+cat("✓ PCA boxplots saved: 'pca_boxplots_by_cluster.png'\n")
+
+
+# ========================================
+# STEP 9C: Silhouette Analysis (Histogram)
+# ========================================
+
+cat("\nSTEP 7B: Silhouette analysis using histogram...\n")
+
+# Compute silhouette for final spatial clustering
+sil_final <- silhouette(as.numeric(wards_final$Cluster_Spatial), D0)
+
+sil_df <- data.frame(
+  Silhouette_Width = sil_final[, 3],
+  Cluster = factor(
+    sil_final[, 1],
+    levels = sort(unique(sil_final[, 1])),
+    #labels = paste("Cluster", sort(unique(sil_final[, 1])))
+    labels = c(
+      "Affluent Residential",
+      "Quiet Residential (Deprived)",
+      "Quiet Residential (Low Accessibility)",
+      "Cumulative Impact Zone"
+    )
+  )
+)
+
+avg_silhouette <- mean(sil_df$Silhouette_Width)
+
+cat(sprintf("  Overall average silhouette width: %.3f\n", avg_silhouette))
+
+# Compute mean silhouette width per cluster
+cluster_centers <- sil_df %>%
+  group_by(Cluster) %>%
+  summarise(
+    Cluster_Mean_Silhouette = mean(Silhouette_Width, na.rm = TRUE)
+  )
+
+# Histogram
+p_sil_hist_cluster <- ggplot(sil_df, aes(x = Silhouette_Width)) +
+  
+  # Histogram
+  geom_histogram(
+    binwidth = 0.05,
+    fill = "grey",
+    color = "white",
+    alpha = 0.8
+  ) +
+  
+  # Overall average silhouette (red dashed)
+  geom_vline(
+    aes(xintercept = avg_silhouette,
+        color = "Overall average silhouette",
+        linetype = "Overall average silhouette"),
+    linewidth = 1
+  ) +
+  
+  # Cluster-specific mean silhouette (yellow solid)
+  geom_vline(
+    data = cluster_centers,
+    aes(xintercept = Cluster_Mean_Silhouette,
+        color = "Cluster mean silhouette",
+        linetype = "Cluster mean silhouette"),
+    linewidth = 1.2
+  ) +
+  
+  facet_wrap(~ Cluster, ncol = 2) +
+  
+  scale_color_manual(
+    name = "Reference lines",
+    values = c(
+      "Overall average silhouette" = "red",
+      "Cluster mean silhouette" = "yellow"
+    )
+  ) +
+  
+  scale_linetype_manual(
+    name = "Reference lines",
+    values = c(
+      "Overall average silhouette" = "dashed",
+      "Cluster mean silhouette" = "solid"
+    )
+  ) +
+  
+  labs(
+    title = "Silhouette Width Distribution by Spatial Cluster",
+    subtitle = paste(
+      "Red dashed line = overall average silhouette (",
+      round(avg_silhouette, 2),
+      "); Yellow line = cluster-specific mean",
+      sep = ""
+    ),
+    x = "Silhouette Width",
+    y = "Number of Wards"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+  )
+
+print(p_sil_hist_cluster)
+
+
+
+ggsave("silhouette_histogram_by_cluster.png",
+       p_sil_hist_cluster,
+       width = 10, height = 7, dpi = 300)
+
+cat("✓ Silhouette histogram by cluster saved: 'silhouette_histogram_by_cluster.png'\n")
+cat("✓ Each panel shows the silhouette values of wards belonging to one cluster, 
+    while the red dashed vertical line indicates the overall average silhouette width (≈ 0.02) across all wards.
+    Silhouette width distributions reveal that the Cumulative Impact Zone is a highly distinct cluster, 
+    while residential clusters display more gradual transitions and boundary cases, 
+    reflecting the continuous nature of urban socio-spatial variation rather than poor clustering performance'\n")
+
+
+# ========================================
+# STEP 9D: Boxplots of Crime and Venue Density
+# ========================================
+
+library(patchwork)
+
+cat("\nSTEP 9A: Boxplots of key variables by cluster...\n")
+
+boxplot_data <- wards_final %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Cluster_Spatial)) %>%
+  mutate(Cluster_Spatial = factor(Cluster_Spatial))
+
+# Crime density boxplot
+p_crime_box <- ggplot(boxplot_data,
+                      aes(x = Cluster_Spatial, y = crime_density, fill = Cluster_Spatial)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Crime Density",
+    x = "Cluster",
+    y = "Crimes per km²"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Venue density boxplot
+p_venue_box <- ggplot(boxplot_data,
+                      aes(x = Cluster_Spatial, y = venue_density, fill = Cluster_Spatial)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Venue Density",
+    x = "Cluster",
+    y = "Venues per km²"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Combine plots side by side
+p_combined_box <- p_crime_box + p_venue_box +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Crime and Venue Density by Spatial Cluster",
+    subtitle = "Distributions highlight differences in intensity and variability across clusters"
+  )
+
+print(p_combined_box)
+ggsave("crime_venue_density_boxplots.png",
+       p_combined_box, width = 12, height = 6, dpi = 300)
+
+cat("✓ Combined boxplot saved: 'crime_venue_density_boxplots.png'\n")
+
+
+
+
+
+# =============================================
+# Part 3: Socio-Economic Context & Policy Maps
+# =============================================
+
+# ========================================
+# STEP 10: Assign Interpretive Labels
+# ========================================
+c
+cat("\nSTEP 10: Assigning interpretive labels to clusters...\n")
+
+# Calculate standardized profiles
+profile_standardized <- cluster_profile %>%
+  mutate(
+    Z_Crime = (Avg_Crime_Density - mean(Avg_Crime_Density)) / sd(Avg_Crime_Density),
+    Z_Venue = (Avg_Venue_Density - mean(Avg_Venue_Density)) / sd(Avg_Venue_Density),
+    Z_Income = (Avg_Median_Income - mean(Avg_Median_Income)) / sd(Avg_Median_Income),
+    Z_PTAL = (Avg_PTAL - mean(Avg_PTAL)) / sd(Avg_PTAL)
+  )
+
+# Assign labels based on crime/venue patterns
+# Create unique label for each of the k=4 clusters
+cluster_labels <- profile_standardized %>%
+  mutate(Cluster_ID = Cluster_Spatial) %>%
+  arrange(desc(Z_Crime), desc(Z_Venue)) %>%
+  mutate(
+    Crime_Rank = row_number(),
+    # Temporary quadrant classification
+    Temp_Quadrant = case_when(
+      Z_Crime > 0 & Z_Venue > 0 ~ "HighCrime_HighVenue",
+      Z_Crime > 0 & Z_Venue <= 0 ~ "HighCrime_LowVenue",
+      Z_Crime <= 0 & Z_Venue > 0 ~ "LowCrime_HighVenue",
+      Z_Crime <= 0 & Z_Venue <= 0 ~ "LowCrime_LowVenue",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  # Assign base label by quadrant, then ensure uniqueness by adding suffix
+  mutate(
+    # Base label from quadrant
+    Base_Label = case_when(
+      Temp_Quadrant == "HighCrime_HighVenue" ~ "Cumulative Impact Zone",
+      Temp_Quadrant == "HighCrime_LowVenue" ~ "Crime Hotspot",
+      Temp_Quadrant == "LowCrime_HighVenue" ~ "Safe Nightlife Hub",
+      Temp_Quadrant == "LowCrime_LowVenue" & Z_Income > 0 ~ "Affluent Residential",
+      Temp_Quadrant == "LowCrime_LowVenue" ~ "Quiet Residential",
+      TRUE ~ "Mixed Zone"
+    )
+  ) %>%
+  # Add suffix to ensure each cluster gets unique label
+  group_by(Base_Label) %>%
+  mutate(
+    Label_Suffix = if(n() > 1) {
+      # Multiple clusters with same base label - add differentiator
+      case_when(
+        row_number(desc(Z_Crime)) == 1 ~ " (High Priority)",
+        row_number(desc(Z_Crime)) == 2 ~ " (Moderate Priority)",
+        row_number(desc(Z_Crime)) == 3 ~ " (Low Priority)",
+        TRUE ~ paste0(" (", row_number(desc(Z_Crime)), ")")
+      )
+    } else {
+      ""  # Only one cluster with this label - no suffix needed
+    },
+    Label = paste0(Base_Label, Label_Suffix)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-Base_Label, -Label_Suffix) %>%
+  mutate(
+    # Priority level based on Z-Crime thresholds
+    Priority = case_when(
+      Z_Crime > 1.5 ~ "CRITICAL",
+      Z_Crime > 0.8 ~ "HIGH",
+      Z_Crime > 0 ~ "MEDIUM",
+      Z_Crime > -0.85 ~ "LOW",
+      TRUE ~ "VERY LOW"
+    ),
+    # Dominant characteristic
+    Dominant_Feature = case_when(
+      abs(Z_Crime) >= abs(Z_Venue) & abs(Z_Crime) >= abs(Z_Income) & Z_Crime > 0 ~ "High Crime",
+      abs(Z_Crime) >= abs(Z_Venue) & abs(Z_Crime) >= abs(Z_Income) & Z_Crime <= 0 ~ "Low Crime",
+      abs(Z_Venue) >= abs(Z_Crime) & abs(Z_Venue) >= abs(Z_Income) & Z_Venue > 0 ~ "High Nightlife",
+      abs(Z_Venue) >= abs(Z_Crime) & abs(Z_Venue) >= abs(Z_Income) & Z_Venue <= 0 ~ "Low Nightlife",
+      abs(Z_Income) >= abs(Z_Crime) & abs(Z_Income) >= abs(Z_Venue) & Z_Income > 0 ~ "Affluent",
+      abs(Z_Income) >= abs(Z_Crime) & abs(Z_Income) >= abs(Z_Venue) & Z_Income <= 0 ~ "Deprived",
+      TRUE ~ "Mixed"
+    )
+  )
+
+# Verify we have exactly k unique labels
+n_unique_labels <- length(unique(cluster_labels$Label))
+cat(sprintf("\n✓ Created %d distinct policy zones from %d clusters\n",
+            n_unique_labels, k_optimal))
+
+if(n_unique_labels != k_optimal) {
+  cat(sprintf("  ⚠ Warning: Expected %d labels but got %d\n", k_optimal, n_unique_labels))
+  cat("  Labels: ", paste(unique(cluster_labels$Label), collapse = ", "), "\n")
+}
+
+# Arrange by cluster ID for consistent ordering
+cluster_labels <- cluster_labels %>% arrange(Cluster_ID)
+
+# Print cluster characterization
+cat("\nCLUSTER CHARACTERIZATION:\n")
+for(i in 1:nrow(cluster_labels)) {
+  row <- cluster_labels[i, ]
+  cat(sprintf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+  cat(sprintf("CLUSTER %s: %s\n", row$Cluster_ID, row$Label))
+  cat(sprintf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+  cat(sprintf("Wards: %d | Priority: %s | Dominant: %s\n\n",
+              row$N_Wards, row$Priority, row$Dominant_Feature))
+  cat(sprintf("  Crime Density:    %6.1f/km² (Z = %+.2f)\n", row$Avg_Crime_Density, row$Z_Crime))
+  cat(sprintf("  Venue Density:    %6.1f/km² (Z = %+.2f)\n", row$Avg_Venue_Density, row$Z_Venue))
+  cat(sprintf("  Median Income:    £%6d (Z = %+.2f)\n", row$Avg_Median_Income, row$Z_Income))
+  cat(sprintf("  PTAL Score:       %6.1f/6 (Z = %+.2f)\n", row$Avg_PTAL, row$Z_PTAL))
+}
+
+# ========================================
+# STEP 11: Create Heatmap Visualization
+# ========================================
+
+cat("\n\nSTEP 11: Creating cluster profile heatmap...\n")
+
+# Prepare data for heatmap
+profile_for_viz <- cluster_labels %>%
+  dplyr::select(Cluster_ID, Label, Z_Crime, Z_Venue, Z_Income, Z_PTAL) %>%
+  pivot_longer(cols = starts_with("Z_"),
+               names_to = "Variable",
+               values_to = "Z_Score") %>%
+  mutate(
+    Variable = case_when(
+      Variable == "Z_Crime" ~ "Crime Density",
+      Variable == "Z_Venue" ~ "Venue Density",
+      Variable == "Z_Income" ~ "Median Income",
+      Variable == "Z_PTAL" ~ "Transport Access"
+    )
+  )
+
+# Create heatmap
+p_heatmap <- ggplot(profile_for_viz, aes(x = Variable, y = Label, fill = Z_Score)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.1f", Z_Score)),
+            color = ifelse(abs(profile_for_viz$Z_Score) > 1, "white", "black"),
+            size = 4, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "green", mid = "orange", high = "red",
+    midpoint = 0,
+    name = "Z-Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Cluster Profiles: Standardized Characteristics",
+    subtitle = "Z-scores show how many standard deviations each cluster is from the mean",
+    x = "", y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    panel.grid = element_blank()
+  )
+
+print(p_heatmap)
+ggsave("cluster_profiles_heatmap.png", p_heatmap, width = 10, height = 6, dpi = 300)
+cat("✓ Heatmap saved: 'cluster_profiles_heatmap.png'\n")
+
+# ========================================
+# STEP 12: Join Labels to Spatial Data
+# ========================================
+
+cat("\nSTEP 12: Joining labels to spatial data...\n")
+
+# Remove any existing label columns to avoid conflicts
+wards_final <- wards_final %>%
+  dplyr::select(-any_of(c("Label", "Priority", "Dominant_Feature", "Temp_Quadrant")))
+
+# Create lookup table - ensure Cluster_ID matches the original cluster numbers
+label_lookup <- cluster_labels %>%
+  dplyr::select(Cluster_ID, Label, Priority, Dominant_Feature, Temp_Quadrant)
+
+# Check the data types for debugging
+cat(sprintf("  Cluster_Spatial type in wards_final: %s\n", class(wards_final$Cluster_Spatial)[1]))
+cat(sprintf("  Cluster_ID type in label_lookup: %s\n", class(label_lookup$Cluster_ID)[1]))
+cat(sprintf("  Unique Cluster_Spatial values: %s\n", paste(unique(wards_final$Cluster_Spatial), collapse=", ")))
+cat(sprintf("  Unique Cluster_ID values: %s\n", paste(unique(label_lookup$Cluster_ID), collapse=", ")))
+
+# Join to spatial data (convert both to character for safe joining)
+wards_final <- wards_final %>%
+  mutate(join_key = as.character(Cluster_Spatial)) %>%
+  left_join(
+    label_lookup %>% mutate(join_key = as.character(Cluster_ID)) %>% dplyr::select(-Cluster_ID),
+    by = "join_key"
+  ) %>%
+  dplyr::select(-join_key)
+
+# Verify join worked
+cat(sprintf("  Wards with labels: %d / %d\n", sum(!is.na(wards_final$Label)), nrow(wards_final)))
+if(sum(!is.na(wards_final$Label)) == 0) {
+  cat("  ⚠ WARNING: No labels were joined! Check cluster ID matching.\n")
+} else {
+  cat("✓ Labels joined successfully\n")
+}
+
+# ========================================
+# STEP 13: Ward-Level Distribution Plot
+# ========================================
+
+cat("\nSTEP 13: Creating ward-level distribution plot...\n")
+
+ward_data <- wards_final %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Label) & !is.na(crime_density) & !is.na(venue_density)) %>%
+  mutate(
+    Z_Crime_ward = (crime_density - mean(crime_density, na.rm = TRUE)) / sd(crime_density, na.rm = TRUE),
+    Z_Venue_ward = (venue_density - mean(venue_density, na.rm = TRUE)) / sd(venue_density, na.rm = TRUE)
+  )
+
+p_wards <- ggplot(ward_data, aes(x = Z_Venue_ward, y = Z_Crime_ward, color = Label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 1, color = "gray30") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1, color = "gray30") +
+  geom_point(alpha = 0.6, size = 2.5) +
+  scale_color_brewer(palette = "Set1", name = "Policy Zone") +
+  labs(
+    title = "Crime vs Venue Density: All London Wards by Policy Zone",
+    subtitle = paste(nrow(ward_data), "wards colored by policy classification"),
+    x = "Venue Density (Z-score)",
+    y = "Crime Density (Z-score)"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_wards)
+ggsave("ward_level_distribution.png", p_wards, width = 10, height = 8, dpi = 300)
+cat("✓ Ward distribution plot saved: 'ward_level_distribution.png'\n")
+
+# ========================================
+# STEP 14: Spatial Maps
+# ========================================
+
+cat("\nSTEP 14: Creating spatial maps...\n")
+
+# Map 1: Crime/Venue Quadrants
+wards_quadrant <- wards_final %>%
+  filter(!is.na(crime_density) & !is.na(venue_density)) %>%
+  mutate(
+    Z_Crime_ward = (crime_density - mean(crime_density, na.rm = TRUE)) / sd(crime_density, na.rm = TRUE),
+    Z_Venue_ward = (venue_density - mean(venue_density, na.rm = TRUE)) / sd(venue_density, na.rm = TRUE),
+    Quadrant_Label = case_when(
+      Z_Crime_ward > 0 & Z_Venue_ward > 0 ~ "High Crime, High Venues",
+      Z_Crime_ward > 0 & Z_Venue_ward <= 0 ~ "High Crime, Low Venues",
+      Z_Crime_ward <= 0 & Z_Venue_ward > 0 ~ "Low Crime, High Venues",
+      Z_Crime_ward <= 0 & Z_Venue_ward <= 0 ~ "Low Crime, Low Venues"
+    ),
+    Quadrant_Label = factor(Quadrant_Label,
+                            levels = c("High Crime, High Venues",
+                                       "High Crime, Low Venues",
+                                       "Low Crime, High Venues",
+                                       "Low Crime, Low Venues"))
+  )
+
+m_quadrants <- tm_shape(wards_quadrant) +
+  tm_polygons(
+    "Quadrant_Label",
+    palette = c("#d73027", "#F5B427", "#CFF527", "#45BA32"),
+    title = "Crime/Venue\nQuadrant",
+    border.col = "white",
+    border.lwd = 0.5
+  ) +
+  tm_layout(
+    main.title = "London Wards: Crime/Venue Quadrant Classification",
+    legend.outside = TRUE,
+    legend.outside.position = "right"
+  )
+
+print(m_quadrants)
+tmap_save(m_quadrants, "map_crime_venue_quadrants.png", width = 10, height = 8, dpi = 300)
+cat("✓ Quadrant map saved: 'map_crime_venue_quadrants.png'\n")
+
+# Map 2: Policy Labels
+if("Label" %in% names(wards_final)) {
+  unique_labels <- unique(wards_final$Label[!is.na(wards_final$Label)])
+
+  # Use distinct colors for each of the 4 policy zones (not just shades)
+  # Print labels for debugging
+  cat(sprintf("  Unique policy labels (%d): %s\n",
+              length(unique_labels),
+              paste(unique_labels, collapse=", ")))
+
+  label_colors <- setNames(
+    sapply(unique_labels, function(lbl) {
+      # Cumulative Impact zones
+      if(grepl("Cumulative Impact", lbl)) {
+        if(grepl("High Priority", lbl)) return("#d73027")      # Red
+        else if(grepl("Moderate Priority", lbl)) return("#fc8d59")  # Orange
+        else return("#d73027")
+      }
+      # Crime Hotspot zones
+      else if(grepl("Crime Hotspot", lbl)) {
+        if(grepl("High Priority", lbl)) return("#fee08b")      # Yellow
+        else if(grepl("Moderate Priority", lbl)) return("#ffffbf")  # Light yellow
+        else return("#fc8d59")
+      }
+      # Safe Nightlife zones
+      else if(grepl("Safe Nightlife", lbl)) {
+        if(grepl("High Priority", lbl)) return("#91bfdb")      # Light blue
+        else if(grepl("Moderate Priority", lbl)) return("#c7e9b4")  # Light green
+        else return("#b9e857")
+      }
+      # Affluent zones - VERY DIFFERENT COLORS
+      else if(grepl("Affluent", lbl)) {
+        if(grepl("High Priority", lbl)) return("#2166ac")      # Dark blue
+        else if(grepl("Moderate Priority", lbl)) return("#1b7837")  # Dark green (DISTINCT!)
+        else return("#3bb21e")
+      }
+      # Quiet/Residential zones
+      else if(grepl("Quiet|Residential", lbl)) {
+        if(grepl("High Priority", lbl)) return("#e0f3f8")      # Very light blue
+        else if(grepl("Moderate Priority", lbl)) return("#f7f7f7")  # Almost white
+        else return("#e2e857")
+      }
+      else return("#969696")  # Gray fallback
+    }),
+    unique_labels
+  )
+
+  cat("  Assigned colors:\n")
+  for(i in seq_along(unique_labels)) {
+    cat(sprintf("    %s → %s\n", unique_labels[i], label_colors[i]))
+  }
+
+  m_policy_labels <- tm_shape(wards_final %>% filter(!is.na(Label))) +
+    tm_polygons(
+      "Label",
+      palette = label_colors,
+      title = "Policy\nClassification",
+      border.col = "white",
+      border.lwd = 0.5
+    ) +
+    tm_layout(
+      main.title = "London Wards: Policy Label Classification",
+      legend.outside = TRUE,
+      legend.outside.position = "right"
+    )
+
+  print(m_policy_labels)
+  tmap_save(m_policy_labels, "map_policy_labels.png", width = 10, height = 8, dpi = 300)
+  cat("✓ Policy label map saved: 'map_policy_labels.png'\n")
+}
+
+# ========================================
+# STEP 15: Policy Implications
+# ========================================
+
+cat("\n\nSTEP 15: Generating policy recommendations...\n")
+
+policy_recommendations <- cluster_labels %>%
+  mutate(
+    Policy_Focus = case_when(
+      # High crime + high venues
+      grepl("Cumulative Impact|High Crime Nightlife", Label, ignore.case = TRUE) ~
+        "License restrictions for new alcohol venues, late-night police patrols, CCTV expansion",
+      # High crime + low venues
+      grepl("Crime Hotspot|Moderate Crime", Label, ignore.case = TRUE) ~
+        "Enhanced policing NOT focused on alcohol licensing, investigate non-alcohol crime drivers",
+      # Low crime + high venues
+      grepl("Safe Nightlife", Label, ignore.case = TRUE) ~
+        "Economic development support, maintain current safety standards, promote as cultural asset",
+      # Low crime + low venues (affluent)
+      grepl("Affluent", Label, ignore.case = TRUE) ~
+        "Protect residential quality of life, monitor spillover from neighboring zones",
+      # Low crime + low venues (other)
+      grepl("Quiet|Mixed Residential", Label, ignore.case = TRUE) ~
+        "Standard community policing, minimal intervention required",
+      TRUE ~ "Mixed strategy based on local assessment and crime rank"
+    ),
+    Recommended_Actions = case_when(
+      Priority == "CRITICAL" ~
+        "1) Immediate patrol increase 2) Emergency license review 3) Multi-agency task force",
+      Priority == "HIGH" ~
+        "1) Enhanced CCTV coverage 2) Improved lighting 3) Business engagement",
+      Priority == "MEDIUM" ~
+        "1) Community policing 2) Monitor trends monthly 3) Preventive programs",
+      Priority == "LOW" ~
+        "1) Standard patrols 2) Quarterly monitoring",
+      TRUE ~
+        "1) Standard patrols 2) Annual review"
+    )
+  )
+
+# Print policy implications
+cat("\nPOLICY RECOMMENDATIONS BY CLUSTER:\n")
+for(i in 1:nrow(policy_recommendations)) {
+  cat(sprintf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+  cat(sprintf("CLUSTER %s: %s\n",
+              policy_recommendations$Cluster_ID[i],
+              policy_recommendations$Label[i]))
+  cat(sprintf("Priority: %s (%d wards)\n",
+              policy_recommendations$Priority[i],
+              policy_recommendations$N_Wards[i]))
+  cat(sprintf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+  cat(sprintf("\nPOLICY FOCUS:\n%s\n", policy_recommendations$Policy_Focus[i]))
+  cat(sprintf("\nRECOMMENDED ACTIONS:\n%s\n", policy_recommendations$Recommended_Actions[i]))
+}
+
+# Create priority map based on Z-score thresholds
+m_priority <- tm_shape(wards_final) +
+  tm_polygons("Priority",
+              palette = c("VERY LOW" = "darkgreen",   
+                          "LOW" = "#aae97d",         # Light green
+                          "MEDIUM" = "yellow",      
+                          "HIGH" = "orange",        
+                          "CRITICAL" = "red"),   
+              title = "Action Priority\n(Z-score based)",
+              border.col = "white",
+              lwd = 0.5) +
+  tm_layout(
+    main.title = "Policy Priority Zones (Crime Z-Score Thresholds)",
+    legend.position = c("right", "bottom")
+  )
+
+print(m_priority)
+tmap_save(m_priority, "policy_priority_map.png", width = 10, height = 8, dpi = 300)
+cat("\n✓ Priority map saved: 'policy_priority_map.png'\n")
+
+# ========================================
+# STEP 16: Export Results
+# ========================================
+
+cat("\n\nSTEP 16: Exporting results...\n")
+
+# Export cluster profiles
+cluster_export <- cluster_labels %>%
+  dplyr::select(
+    Cluster_ID, Label, Priority, N_Wards, Dominant_Feature,
+    Avg_Crime_Density, Avg_Venue_Density, Avg_Median_Income,
+    Avg_PTAL, Z_Crime, Z_Venue, Z_Income
+  )
+
+write.csv(cluster_export, "cluster_profiles_detailed.csv", row.names = FALSE)
+cat("  ✓ Detailed profiles: 'cluster_profiles_detailed.csv'\n")
+
+# Export policy recommendations
+write.csv(policy_recommendations, "cluster_policy_recommendations.csv", row.names = FALSE)
+cat("  ✓ Policy recommendations: 'cluster_policy_recommendations.csv'\n")
+
+# Export spatial data
+st_write(wards_final, "policy_zones.shp", delete_dsn = TRUE, quiet = TRUE)
+cat("  ✓ Spatial data: 'policy_zones.shp'\n")
+
+cat("\n✓ Analysis complete!\n")
+
+# ========================================
+# SUMMARY
+# ========================================
+
+cat("\n===============================================\n")
+cat("CLUSTERING WORKFLOW SUMMARY\n")
+cat("===============================================\n")
+cat("\nWhat we accomplished:\n")
+cat("\n1. DATA PREPARATION")
+cat("\n   - Aggregated crime & venue data to ward level")
+cat("\n   - Joined socioeconomic variables")
+cat("\n   - Standardized all variables for clustering\n")
+cat("\n2. DISTANCE MATRICES")
+cat("\n   - D0: Attribute distance (similarity)")
+cat("\n   - D1: Geographic distance (proximity)\n")
+cat("\n3. OPTIMAL k SELECTION")
+cat("\n   - Used Elbow method & Silhouette analysis")
+cat("\n   - Chose k=4 clusters for balance\n")
+cat("\n4. OPTIMAL α SELECTION")
+cat("\n   - Tested α from 0 to 1")
+cat("\n   - Chose α=0.3 (70% data, 30% geography)\n")
+cat("\n5. CLUSTER CREATION")
+cat("\n   - Standard clustering (α=0)")
+cat("\n   - Spatially constrained (α=0.3)")
+cat("\n   - Spatially constrained = more contiguous!\n")
+cat("\n6. INTERPRETIVE LABELS")
+cat("\n   - Assigned policy-relevant names")
+cat("\n   - Set priority levels (CRITICAL to VERY LOW)")
+cat("\n   - Identified dominant features\n")
+cat("\n7. VISUALIZATION")
+cat("\n   - Heatmap of cluster characteristics")
+cat("\n   - Ward-level scatter plot")
+cat("\n   - Quadrant maps")
+cat("\n   - Policy label maps")
+cat("\n   - Priority maps\n")
+cat("\n8. POLICY RECOMMENDATIONS")
+cat("\n   - Custom strategies for each cluster type")
+cat("\n   - Action priorities")
+cat("\n   - Resource allocation guidance\n")
+cat("\n===============================================\n")
+cat("KEY TAKEAWAY: ClustGeo creates ACTIONABLE zones\n")
+cat("by balancing statistical similarity with\n")
+cat("administrative feasibility.\n")
+cat("===============================================\n\n")
